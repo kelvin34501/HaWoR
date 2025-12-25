@@ -77,3 +77,7 @@ ipython_config.py
 
 vis.mp4
 imgui.ini
+
+# custom
+/example/**
+/tmp

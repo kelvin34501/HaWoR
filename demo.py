@@ -21,7 +21,7 @@ if __name__ == '__main__':
     parser.add_argument("--input_type", type=str, default='file')
     parser.add_argument("--checkpoint",  type=str, default='./weights/hawor/checkpoints/hawor.ckpt')
     parser.add_argument("--infiller_weight",  type=str, default='./weights/hawor/checkpoints/infiller.pt')
-    parser.add_argument("--vis_mode",  type=str, default='world', help='cam | world')
+    parser.add_argument("--vis_mode",  type=str, default='world', help='off | cam | world')
     args = parser.parse_args()
 
     start_idx, end_idx, seq_folder, imgfiles = detect_track_video(args)
@@ -94,7 +94,9 @@ if __name__ == '__main__':
     right_dict['vertices'] = torch.einsum('ij,btnj->btni', R_x, right_dict['vertices'].cpu())
     
     # Here we use aitviewer(https://github.com/eth-ait/aitviewer) for simple visualization.
-    if args.vis_mode == 'world': 
+    if args.vis_mode == 'off':
+        print("Skipping visualization (vis_mode=off)")
+    elif args.vis_mode == 'world': 
         output_pth = os.path.join(seq_folder, f"vis_{vis_start}_{vis_end}")
         if not os.path.exists(output_pth):
             os.makedirs(output_pth)
