@@ -11,6 +11,7 @@ import sys
 import json
 import argparse
 import subprocess
+import threading
 from pathlib import Path
 from glob import glob
 
@@ -24,6 +25,17 @@ from PIL import Image, ImageDraw, ImageFont
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.models.mano_wrapper import MANO
+
+
+def drain_stderr_pipe(pipe, output_list):
+    """Drain stderr pipe in background thread to prevent buffer deadlock."""
+    try:
+        for line in iter(pipe.readline, b''):
+            output_list.append(line.decode('utf-8', errors='replace'))
+    except Exception:
+        pass
+    finally:
+        pipe.close()
 
 
 def load_cam_space_chunk(json_path):
@@ -118,7 +130,7 @@ def project_points_cam(points, fx, fy, cx, cy):
     return np.stack([u, v], axis=-1), Z
 
 
-def draw_hand_skeleton(img, keypoints_2d, color=(0, 150, 0), thickness=2):
+def draw_hand_skeleton(img, keypoints_2d, color=(0, 150, 0), thickness=4):
     """
     Draw hand skeleton on image.
     OpenPose hand 21 keypoints topology.
@@ -143,7 +155,7 @@ def draw_hand_skeleton(img, keypoints_2d, color=(0, 150, 0), thickness=2):
     # Draw keypoints
     for pt in keypoints_2d:
         if np.isfinite(pt).all():
-            cv2.circle(img, tuple(pt.astype(int)), 3, color, -1, cv2.LINE_AA)
+            cv2.circle(img, tuple(pt.astype(int)), 6, color, -1, cv2.LINE_AA)
 
     return img
 
@@ -189,18 +201,24 @@ def get_caption_for_frame(frame_idx, clips, extraction_fps=30, captions_fps=50):
         captions_fps: FPS of the original video that captions refer to (default 50)
         
     Returns:
-        Dict with 'desc', 'start', 'end' keys, or None if frame is outside all clip ranges
+        Dict with 'desc', 'start', 'end', 'extracted_start', 'extracted_end' keys, 
+        or None if frame is outside all clip ranges
     """
     # Convert frame_idx from extraction_fps to captions_fps
     # frame_in_original = frame_in_extracted * (captions_fps / extraction_fps)
     frame_idx_converted = frame_idx * (captions_fps / extraction_fps)
     
     for clip in clips:
-        if clip["start"] <= frame_idx_converted <= clip["end"]:
+        if clip["start"] <= frame_idx_converted < clip["end"]:
+            # Calculate extracted frame range
+            extracted_start = int(clip["start"] * extraction_fps / captions_fps)
+            extracted_end = int(clip["end"] * extraction_fps / captions_fps)
             return {
                 "desc": clip["desc"],
                 "start": clip["start"],
-                "end": clip["end"]
+                "end": clip["end"],
+                "extracted_start": extracted_start,
+                "extracted_end": extracted_end
             }
     return None
 
@@ -277,8 +295,8 @@ def calculate_fade_alpha(frame_idx, caption_start_frame, caption_end_frame, fade
     return 1.0
 
 
-def draw_caption(img, caption_data, alpha=1.0, font_size_title=20, font_size_desc=16, 
-                font_size_frame=14, padding=20, corner_radius=15, position='top-left'):
+def draw_caption(img, caption_data, alpha=1.0, font_size_title=70, font_size_desc=55, 
+                font_size_frame=45, padding=20, corner_radius=15, position='top-left'):
     """
     Draw caption with rounded corners and multi-line layout using PIL.
     
@@ -316,9 +334,18 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=20, font_size_des
     # Prepare text content
     skill_text = "Skill: Unknown"
     desc_text = caption_data['desc']
-    frame_text = f"Frame Duration: {int(caption_data['start'])}-{int(caption_data['end'])}"
     
-    # Calculate text dimensions
+    # Two lines for frame duration - check if extracted frame info is available
+    if 'extracted_start' in caption_data and 'extracted_end' in caption_data:
+        frame_text_1 = f"Extracted Frames (30fps): {caption_data['extracted_start']}-{caption_data['extracted_end']}"
+        frame_text_2 = f"Original Video Frames (50fps): {int(caption_data['start'])}-{int(caption_data['end'])}"
+    else:
+        # Fallback to single line if extracted frame info not available
+        frame_text_1 = f"Frame Duration: {int(caption_data['start'])}-{int(caption_data['end'])}"
+        frame_text_2 = None
+    
+    # Calculate box dimensions - occupy top 1/4 of the frame
+    box_height = h // 4  # 1/4 of frame height
     max_text_width = w - 4 * padding - 40  # Leave margin from edges
     
     # Wrap description text
@@ -333,13 +360,15 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=20, font_size_des
         bbox = draw.textbbox((0, 0), line, font=font_desc)
         desc_height += (bbox[3] - bbox[1]) + 5  # 5px line spacing
     
-    frame_bbox = draw.textbbox((0, 0), frame_text, font=font_frame)
-    frame_height = frame_bbox[3] - frame_bbox[1]
+    frame_bbox_1 = draw.textbbox((0, 0), frame_text_1, font=font_frame)
+    frame_height = frame_bbox_1[3] - frame_bbox_1[1]
+    if frame_text_2:
+        frame_bbox_2 = draw.textbbox((0, 0), frame_text_2, font=font_frame)
+        frame_height += (frame_bbox_2[3] - frame_bbox_2[1]) + 5  # Add second line height with spacing
     
-    box_width = max_text_width + 2 * padding
-    box_height = title_height + desc_height + frame_height + 4 * padding + 10  # Extra spacing between sections
+    box_width = w - 40  # Full width minus margins (20px on each side)
     
-    # Position the box
+    # Position the box - with margin from edges
     if position == 'top-left':
         box_x = 20
         box_y = 20
@@ -350,33 +379,40 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=20, font_size_des
         box_x = 20
         box_y = 20
     
+    # Ensure box stays within frame bounds
+    if box_x + box_width > w:
+        box_width = w - box_x
+    
     # Draw rounded rectangle background with transparency
-    bg_alpha = int(200 * alpha)  # Semi-transparent black background
+    bg_alpha = int(220 * alpha)  # Semi-transparent white background
     draw.rounded_rectangle(
         [(box_x, box_y), (box_x + box_width, box_y + box_height)],
         radius=corner_radius,
-        fill=(0, 0, 0, bg_alpha)
+        fill=(255, 255, 255, bg_alpha)
     )
     
     # Draw text content
-    text_x = box_x + padding
-    text_y = box_y + padding
+    text_x = box_x + padding + 30  # More left padding
+    text_y = box_y + padding + 10  # More top padding
     
     # Title (Skill name)
     text_alpha = int(255 * alpha)
-    draw.text((text_x, text_y), skill_text, font=font_title, fill=(255, 255, 255, text_alpha))
+    draw.text((text_x, text_y), skill_text, font=font_title, fill=(30, 30, 30, text_alpha))
     text_y += title_height + padding
     
     # Description lines
     for line in desc_lines:
-        draw.text((text_x, text_y), line, font=font_desc, fill=(220, 220, 220, text_alpha))
+        draw.text((text_x, text_y), line, font=font_desc, fill=(50, 50, 50, text_alpha))
         bbox = draw.textbbox((0, 0), line, font=font_desc)
         text_y += (bbox[3] - bbox[1]) + 5
     
     text_y += 5  # Extra spacing
     
-    # Frame duration
-    draw.text((text_x, text_y), frame_text, font=font_frame, fill=(180, 180, 180, text_alpha))
+    # Frame duration (two lines)
+    draw.text((text_x, text_y), frame_text_1, font=font_frame, fill=(80, 80, 80, text_alpha))
+    if frame_text_2:
+        text_y += frame_bbox_1[3] - frame_bbox_1[1] + 5  # Move to next line
+        draw.text((text_x, text_y), frame_text_2, font=font_frame, fill=(80, 80, 80, text_alpha))
     
     # Composite PIL image onto OpenCV image
     img_pil_base = cv2_to_pil(img)
@@ -431,7 +467,7 @@ def load_track_data(cam_space_dir, track_id, is_left, focal, cx, cy, device="cpu
 def visualize_to_video(task_dir, output_path, fps=30, device="cpu", 
                        captions_json=None, segment_def_json=None, 
                        caption_font_scale=0.7, caption_padding=10,
-                       captions_fps=50):
+                       captions_fps=50, start_frame=None, end_frame=None):
     """
     Visualize hand keypoints and encode to video via ffmpeg pipe.
     
@@ -445,6 +481,8 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
         caption_font_scale: Font scale for captions (default 0.7)
         caption_padding: Padding around caption text (default 10)
         captions_fps: FPS of the original video that captions refer to (default 50)
+        start_frame: Start frame index for rendering (optional, 0-based)
+        end_frame: End frame index for rendering (optional, exclusive)
     """
     task_path = Path(task_dir)
     
@@ -466,10 +504,23 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
 
     # Load images
     img_dir = task_path / 'extracted_images'
-    img_files = natsorted(glob(str(img_dir / '*.jpg'))) or natsorted(glob(str(img_dir / '*.png')))
+    all_img_files = natsorted(glob(str(img_dir / '*.jpg'))) or natsorted(glob(str(img_dir / '*.png')))
+    
+    if not all_img_files:
+        raise FileNotFoundError(f"No images found in {img_dir}")
+    
+    # Filter by frame range if specified
+    if start_frame is not None or end_frame is not None:
+        start_idx = start_frame if start_frame is not None else 0
+        end_idx = end_frame if end_frame is not None else len(all_img_files)
+        img_files = all_img_files[start_idx:end_idx]
+        frame_offset = start_idx
+    else:
+        img_files = all_img_files
+        frame_offset = 0
     
     if not img_files:
-        raise FileNotFoundError(f"No images found in {img_dir}")
+        raise ValueError(f"No images in specified range [{start_frame}, {end_frame})")
 
     # Get image dimensions
     first_img = cv2.imread(img_files[0])
@@ -500,6 +551,8 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
     ffmpeg_cmd = [
         'ffmpeg',
         '-y',  # Overwrite output
+        '-loglevel', 'error',  # Minimize stderr output to prevent pipe deadlock
+        '-stats',  # Show encoding progress
         '-f', 'rawvideo',
         '-vcodec', 'rawvideo',
         '-s', f'{w}x{h}',
@@ -516,6 +569,13 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
     # Start ffmpeg process
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, 
                            stderr=subprocess.PIPE)
+    
+    # Start background thread to drain stderr and prevent pipe deadlock
+    stderr_output = []
+    stderr_thread = threading.Thread(target=drain_stderr_pipe, 
+                                    args=(proc.stderr, stderr_output))
+    stderr_thread.daemon = True
+    stderr_thread.start()
 
     try:
         # Track caption changes for fade effects
@@ -525,18 +585,25 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
         fade_frames = 10  # Number of frames for fade transition
         
         # Process frames with progress bar
-        for frame_idx in tqdm(range(len(img_files)), desc="Encoding video"):
-            img = cv2.imread(img_files[frame_idx])
+        for local_idx in tqdm(range(len(img_files)), desc="Encoding video"):
+            # Check if FFmpeg process is still alive every 100 frames
+            if local_idx % 100 == 0 and proc.poll() is not None:
+                raise RuntimeError(f"FFmpeg process died unexpectedly with return code {proc.returncode}")
+            
+            img = cv2.imread(img_files[local_idx])
             if img is None:
                 continue
+            
+            # Calculate actual frame index in original sequence
+            frame_idx = local_idx + frame_offset
 
             # Draw left hand (darker red)
             if frame_idx in left_data:
-                draw_hand_skeleton(img, left_data[frame_idx], color_left, thickness=2)
+                draw_hand_skeleton(img, left_data[frame_idx], color_left, thickness=4)
 
             # Draw right hand (darker green)
             if frame_idx in right_data:
-                draw_hand_skeleton(img, right_data[frame_idx], color_right, thickness=2)
+                draw_hand_skeleton(img, right_data[frame_idx], color_right, thickness=4)
 
             # Draw caption with fade effects if available
             if clips:
@@ -569,12 +636,15 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
 
         # Wait for ffmpeg to finish
         proc.wait()
+        
+        # Wait for stderr thread to finish draining (with timeout)
+        stderr_thread.join(timeout=10)
 
         if proc.returncode == 0:
             print(f"✓ Video saved: {output_path}")
         else:
-            stderr = proc.stderr.read().decode()
-            print(f"✗ FFmpeg error:\n{stderr}")
+            stderr = ''.join(stderr_output)
+            print(f"✗ FFmpeg error (return code {proc.returncode}):\n{stderr}")
 
     except Exception as e:
         proc.kill()
@@ -616,6 +686,8 @@ Note: Default FPS is 30 to match the frame extraction rate in detect_track_video
                        help='Padding around caption text in pixels (default: 10)')
     parser.add_argument('--captions-fps', type=float, default=50.0,
                        help='FPS of the original video that captions refer to (default: 50)')
+    parser.add_argument('--output-dir-per-clip', type=str, default=None,
+                       help='Output directory for per-clip videos. When set, renders each caption clip as a separate video.')
     
     args = parser.parse_args()
 
@@ -640,13 +712,79 @@ Note: Default FPS is 30 to match the frame extraction rate in detect_track_video
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Run visualization
+    # Always render the main full video first
+    print("Rendering main full video...")
     visualize_to_video(args.dir, args.output, fps=args.fps, device=args.device,
                       captions_json=args.captions_json,
                       segment_def_json=args.segment_def_json,
                       caption_font_scale=args.caption_font_scale,
                       caption_padding=args.caption_padding,
                       captions_fps=args.captions_fps)
+
+    # Optionally render per-clip videos if requested
+    if args.output_dir_per_clip:
+        if not args.captions_json:
+            print("Warning: --output-dir-per-clip requires --captions-json to be specified")
+            print("Skipping per-clip rendering.")
+        else:
+            # Create output directory for per-clip videos
+            per_clip_dir = Path(args.output_dir_per_clip)
+            per_clip_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Load captions JSON to get clips
+            with open(args.captions_json, 'r') as f:
+                captions_data = json.load(f)
+            
+            # Find matching task in captions
+            task_name = task_path.name  # e.g., '00_task'
+            task_captions = None
+            for video_entry in captions_data:
+                video_name = Path(video_entry['video']).stem  # e.g., '00_task' from '00_task.mp4'
+                if video_name == task_name:
+                    task_captions = video_entry
+                    break
+            
+            if not task_captions or 'clips' not in task_captions:
+                print(f"Warning: No clips found for task {task_name} in {args.captions_json}")
+                print("Skipping per-clip rendering.")
+            else:
+                clips = task_captions['clips']
+                print(f"\nRendering {len(clips)} clips individually...")
+                
+                for clip_idx, clip in enumerate(clips):
+                    start_frame_caption = clip['start']
+                    end_frame_caption = clip['end']
+                    
+                    # Convert from captions_fps to extraction fps
+                    start_frame = int(start_frame_caption * args.fps / args.captions_fps)
+                    end_frame = int(end_frame_caption * args.fps / args.captions_fps)
+                    
+                    # Generate output filename
+                    output_filename = f"{task_name}_{start_frame_caption:06d}_{end_frame_caption:06d}.mp4"
+                    clip_output_path = per_clip_dir / output_filename
+                    
+                    print(f"\n[{clip_idx+1}/{len(clips)}] Rendering {output_filename}...")
+                    print(f"  Caption frames: [{start_frame_caption}, {end_frame_caption})")
+                    print(f"  Extraction frames: [{start_frame}, {end_frame})")
+                    
+                    # Render this clip
+                    try:
+                        visualize_to_video(
+                            args.dir, clip_output_path, 
+                            fps=args.fps, device=args.device,
+                            captions_json=args.captions_json,
+                            segment_def_json=args.segment_def_json,
+                            caption_font_scale=args.caption_font_scale,
+                            caption_padding=args.caption_padding,
+                            captions_fps=args.captions_fps,
+                            start_frame=start_frame,
+                            end_frame=end_frame
+                        )
+                    except Exception as e:
+                        print(f"  ✗ Failed to render clip: {e}")
+                        continue
+                
+                print(f"\n✓ All clips rendered to: {per_clip_dir}")
 
 
 if __name__ == '__main__':
