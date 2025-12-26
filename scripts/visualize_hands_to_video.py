@@ -19,6 +19,7 @@ import cv2
 import torch
 from natsort import natsorted
 from tqdm import tqdm
+from PIL import Image, ImageDraw, ImageFont
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -188,7 +189,7 @@ def get_caption_for_frame(frame_idx, clips, extraction_fps=30, captions_fps=50):
         captions_fps: FPS of the original video that captions refer to (default 50)
         
     Returns:
-        Caption text string, or None if frame is outside all clip ranges
+        Dict with 'desc', 'start', 'end' keys, or None if frame is outside all clip ranges
     """
     # Convert frame_idx from extraction_fps to captions_fps
     # frame_in_original = frame_in_extracted * (captions_fps / extraction_fps)
@@ -196,20 +197,23 @@ def get_caption_for_frame(frame_idx, clips, extraction_fps=30, captions_fps=50):
     
     for clip in clips:
         if clip["start"] <= frame_idx_converted <= clip["end"]:
-            return clip["desc"]
+            return {
+                "desc": clip["desc"],
+                "start": clip["start"],
+                "end": clip["end"]
+            }
     return None
 
 
-def wrap_text(text, font, font_scale, thickness, max_width):
+def wrap_text_pil(text, font, max_width, draw):
     """
-    Wrap text into multiple lines to fit within max_width.
+    Wrap text into multiple lines to fit within max_width using PIL.
     
     Args:
         text: Text to wrap
-        font: OpenCV font constant
-        font_scale: Font scale
-        thickness: Font thickness
+        font: PIL ImageFont object
         max_width: Maximum width in pixels
+        draw: PIL ImageDraw object for measuring text
         
     Returns:
         List of text lines
@@ -220,9 +224,10 @@ def wrap_text(text, font, font_scale, thickness, max_width):
     
     for word in words:
         test_line = current_line + " " + word if current_line else word
-        text_size = cv2.getTextSize(test_line, font, font_scale, thickness)[0][0]
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        text_width = bbox[2] - bbox[0]
         
-        if text_size <= max_width:
+        if text_width <= max_width:
             current_line = test_line
         else:
             if current_line:
@@ -235,43 +240,151 @@ def wrap_text(text, font, font_scale, thickness, max_width):
     return lines
 
 
-def draw_caption(img, text, font_scale=0.7, padding=10):
+def cv2_to_pil(img):
+    """Convert OpenCV BGR image to PIL RGBA image."""
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb).convert('RGBA')
+
+
+def pil_to_cv2(pil_img):
+    """Convert PIL RGBA image to OpenCV BGR image."""
+    img_rgb = np.array(pil_img.convert('RGB'))
+    return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
+
+def calculate_fade_alpha(frame_idx, caption_start_frame, caption_end_frame, fade_frames=10):
     """
-    Draw caption text at the bottom of the image with semi-transparent background.
+    Calculate fade-in/fade-out alpha value for smooth caption transitions.
     
     Args:
-        img: Image to draw on (modified in-place)
-        text: Caption text to draw
-        font_scale: Font scale (default 0.7)
-        padding: Padding around text in pixels (default 10)
+        frame_idx: Current frame index
+        caption_start_frame: First frame where this caption appears
+        caption_end_frame: Last frame where this caption appears
+        fade_frames: Number of frames for fade transition (default 10)
+        
+    Returns:
+        Alpha value between 0.0 and 1.0
     """
+    # Fade in at the start
+    if frame_idx < caption_start_frame + fade_frames:
+        return (frame_idx - caption_start_frame) / fade_frames
+    
+    # Fade out at the end
+    elif frame_idx > caption_end_frame - fade_frames:
+        return (caption_end_frame - frame_idx) / fade_frames
+    
+    # Full opacity in the middle
+    return 1.0
+
+
+def draw_caption(img, caption_data, alpha=1.0, font_size_title=20, font_size_desc=16, 
+                font_size_frame=14, padding=20, corner_radius=15, position='top-left'):
+    """
+    Draw caption with rounded corners and multi-line layout using PIL.
+    
+    Args:
+        img: OpenCV BGR image to draw on (modified in-place)
+        caption_data: Dict with 'desc', 'start', 'end' keys
+        alpha: Opacity for fade effects (0.0 to 1.0)
+        font_size_title: Font size for skill name
+        font_size_desc: Font size for description
+        font_size_frame: Font size for frame duration
+        padding: Padding inside the caption box
+        corner_radius: Radius for rounded corners
+        position: Position of caption box ('top-left', 'bottom-left', etc.)
+    """
+    if alpha <= 0.0:
+        return
+    
     h, w = img.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    thickness = 2
-    color = (255, 255, 255)  # White text
-    bg_color = (0, 0, 0)      # Black background
     
-    # Wrap text to fit within frame width
-    max_width = w - 2 * padding
-    lines = wrap_text(text, font, font_scale, thickness, max_width)
+    # Load fonts (use default if system fonts not available)
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size_title)
+        font_desc = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size_desc)
+        font_frame = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size_frame)
+    except:
+        # Fallback to default font
+        font_title = ImageFont.load_default()
+        font_desc = ImageFont.load_default()
+        font_frame = ImageFont.load_default()
     
-    # Calculate text box dimensions
-    line_height = cv2.getTextSize("A", font, font_scale, thickness)[0][1]
-    line_spacing = 5
-    total_height = len(lines) * (line_height + line_spacing) + 2 * padding
+    # Create PIL image for drawing
+    pil_img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(pil_img)
     
-    # Draw semi-transparent background at bottom
-    y_start = h - total_height
-    overlay = img.copy()
-    cv2.rectangle(overlay, (0, y_start), (w, h), bg_color, -1)
-    cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
+    # Prepare text content
+    skill_text = "Skill: Unknown"
+    desc_text = caption_data['desc']
+    frame_text = f"Frame Duration: {int(caption_data['start'])}-{int(caption_data['end'])}"
     
-    # Draw text lines
-    y = y_start + padding + line_height
-    for line in lines:
-        cv2.putText(img, line, (padding, y), font, font_scale, 
-                   color, thickness, cv2.LINE_AA)
-        y += line_height + line_spacing
+    # Calculate text dimensions
+    max_text_width = w - 4 * padding - 40  # Leave margin from edges
+    
+    # Wrap description text
+    desc_lines = wrap_text_pil(desc_text, font_desc, max_text_width, draw)
+    
+    # Calculate box dimensions
+    title_bbox = draw.textbbox((0, 0), skill_text, font=font_title)
+    title_height = title_bbox[3] - title_bbox[1]
+    
+    desc_height = 0
+    for line in desc_lines:
+        bbox = draw.textbbox((0, 0), line, font=font_desc)
+        desc_height += (bbox[3] - bbox[1]) + 5  # 5px line spacing
+    
+    frame_bbox = draw.textbbox((0, 0), frame_text, font=font_frame)
+    frame_height = frame_bbox[3] - frame_bbox[1]
+    
+    box_width = max_text_width + 2 * padding
+    box_height = title_height + desc_height + frame_height + 4 * padding + 10  # Extra spacing between sections
+    
+    # Position the box
+    if position == 'top-left':
+        box_x = 20
+        box_y = 20
+    elif position == 'bottom-left':
+        box_x = 20
+        box_y = h - box_height - 20
+    else:  # default to top-left
+        box_x = 20
+        box_y = 20
+    
+    # Draw rounded rectangle background with transparency
+    bg_alpha = int(200 * alpha)  # Semi-transparent black background
+    draw.rounded_rectangle(
+        [(box_x, box_y), (box_x + box_width, box_y + box_height)],
+        radius=corner_radius,
+        fill=(0, 0, 0, bg_alpha)
+    )
+    
+    # Draw text content
+    text_x = box_x + padding
+    text_y = box_y + padding
+    
+    # Title (Skill name)
+    text_alpha = int(255 * alpha)
+    draw.text((text_x, text_y), skill_text, font=font_title, fill=(255, 255, 255, text_alpha))
+    text_y += title_height + padding
+    
+    # Description lines
+    for line in desc_lines:
+        draw.text((text_x, text_y), line, font=font_desc, fill=(220, 220, 220, text_alpha))
+        bbox = draw.textbbox((0, 0), line, font=font_desc)
+        text_y += (bbox[3] - bbox[1]) + 5
+    
+    text_y += 5  # Extra spacing
+    
+    # Frame duration
+    draw.text((text_x, text_y), frame_text, font=font_frame, fill=(180, 180, 180, text_alpha))
+    
+    # Composite PIL image onto OpenCV image
+    img_pil_base = cv2_to_pil(img)
+    img_composited = Image.alpha_composite(img_pil_base, pil_img)
+    img_result = pil_to_cv2(img_composited)
+    
+    # Copy result back to original image
+    img[:] = img_result
 
 
 def load_track_data(cam_space_dir, track_id, is_left, focal, cx, cy, device="cpu"):
@@ -405,6 +518,12 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
                            stderr=subprocess.PIPE)
 
     try:
+        # Track caption changes for fade effects
+        prev_caption_id = None
+        caption_start_frame = 0
+        caption_end_frame = 0
+        fade_frames = 10  # Number of frames for fade transition
+        
         # Process frames with progress bar
         for frame_idx in tqdm(range(len(img_files)), desc="Encoding video"):
             img = cv2.imread(img_files[frame_idx])
@@ -419,14 +538,28 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
             if frame_idx in right_data:
                 draw_hand_skeleton(img, right_data[frame_idx], color_right, thickness=2)
 
-            # Draw caption if available
+            # Draw caption with fade effects if available
             if clips:
-                caption = get_caption_for_frame(frame_idx, clips, 
-                                               extraction_fps=fps, 
-                                               captions_fps=captions_fps)
-                if caption:
-                    draw_caption(img, caption, font_scale=caption_font_scale, 
-                               padding=caption_padding)
+                caption_data = get_caption_for_frame(frame_idx, clips, 
+                                                    extraction_fps=fps, 
+                                                    captions_fps=captions_fps)
+                if caption_data:
+                    # Create unique ID for this caption based on start/end frames
+                    caption_id = (caption_data['start'], caption_data['end'])
+                    
+                    # Detect caption change
+                    if caption_id != prev_caption_id:
+                        prev_caption_id = caption_id
+                        # Convert caption frame range to extraction fps
+                        caption_start_frame = int(caption_data['start'] * fps / captions_fps)
+                        caption_end_frame = int(caption_data['end'] * fps / captions_fps)
+                    
+                    # Calculate fade alpha
+                    alpha = calculate_fade_alpha(frame_idx, caption_start_frame, 
+                                                caption_end_frame, fade_frames)
+                    
+                    # Draw caption with calculated alpha
+                    draw_caption(img, caption_data, alpha=alpha)
 
             # Write frame to ffmpeg stdin
             proc.stdin.write(img.tobytes())
