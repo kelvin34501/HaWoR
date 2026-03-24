@@ -170,7 +170,7 @@ def load_captions(captions_json_path, segment_def_json_path, task_name):
         task_name: Task directory name (e.g., '00_task')
         
     Returns:
-        List of clips with 'start', 'end', 'desc' for this task, or [] if not found
+        List of clips with 'start', 'end', 'caption', 'description' for this task, or [] if not found
     """
     try:
         with open(captions_json_path, 'r') as f:
@@ -196,12 +196,12 @@ def get_caption_for_frame(frame_idx, clips, extraction_fps=30, captions_fps=50):
     
     Args:
         frame_idx: Local frame index in the extracted images (at extraction_fps)
-        clips: List of clip dicts with 'start', 'end', 'desc' (frame ranges at captions_fps)
+        clips: List of clip dicts with 'start', 'end', 'caption', 'description' (frame ranges at captions_fps)
         extraction_fps: FPS of the extracted images (default 30)
         captions_fps: FPS of the original video that captions refer to (default 50)
         
     Returns:
-        Dict with 'desc', 'start', 'end', 'extracted_start', 'extracted_end' keys, 
+        Dict with 'caption', 'desc', 'start', 'end', 'extracted_start', 'extracted_end' keys, 
         or None if frame is outside all clip ranges
     """
     # Convert frame_idx from extraction_fps to captions_fps
@@ -214,7 +214,8 @@ def get_caption_for_frame(frame_idx, clips, extraction_fps=30, captions_fps=50):
             extracted_start = int(clip["start"] * extraction_fps / captions_fps)
             extracted_end = int(clip["end"] * extraction_fps / captions_fps)
             return {
-                "desc": clip["desc"],
+                "caption": clip.get("caption", "Unknown"),
+                "desc": clip.get("description", ""),
                 "start": clip["start"],
                 "end": clip["end"],
                 "extracted_start": extracted_start,
@@ -332,17 +333,19 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=70, font_size_des
     draw = ImageDraw.Draw(pil_img)
     
     # Prepare text content
-    skill_text = "Skill: Unknown"
-    desc_text = caption_data['desc']
+    skill_text = f"Skill: {caption_data.get('caption', 'Unknown')}"
+    desc_text = caption_data.get('desc', '')
     
     # Two lines for frame duration - check if extracted frame info is available
-    if 'extracted_start' in caption_data and 'extracted_end' in caption_data:
-        frame_text_1 = f"Extracted Frames (30fps): {caption_data['extracted_start']}-{caption_data['extracted_end']}"
-        frame_text_2 = f"Original Video Frames (50fps): {int(caption_data['start'])}-{int(caption_data['end'])}"
-    else:
-        # Fallback to single line if extracted frame info not available
-        frame_text_1 = f"Frame Duration: {int(caption_data['start'])}-{int(caption_data['end'])}"
-        frame_text_2 = None
+    # if 'extracted_start' in caption_data and 'extracted_end' in caption_data:
+    #     frame_text_1 = f"Extracted Frames (30fps): {caption_data['extracted_start']}-{caption_data['extracted_end']}"
+    #     frame_text_2 = f"Original Video Frames (50fps): {int(caption_data['start'])}-{int(caption_data['end'])}"
+    # else:
+    #     # Fallback to single line if extracted frame info not available
+    #     frame_text_1 = f"Frame Duration: {int(caption_data['start'])}-{int(caption_data['end'])}"
+    #     frame_text_2 = None
+    frame_text_1 = None
+    frame_text_2 = None
     
     # Calculate box dimensions - occupy top 1/4 of the frame
     box_height = h // 4  # 1/4 of frame height
@@ -360,11 +363,12 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=70, font_size_des
         bbox = draw.textbbox((0, 0), line, font=font_desc)
         desc_height += (bbox[3] - bbox[1]) + 5  # 5px line spacing
     
-    frame_bbox_1 = draw.textbbox((0, 0), frame_text_1, font=font_frame)
-    frame_height = frame_bbox_1[3] - frame_bbox_1[1]
-    if frame_text_2:
-        frame_bbox_2 = draw.textbbox((0, 0), frame_text_2, font=font_frame)
-        frame_height += (frame_bbox_2[3] - frame_bbox_2[1]) + 5  # Add second line height with spacing
+    # frame_bbox_1 = draw.textbbox((0, 0), frame_text_1, font=font_frame)
+    # frame_height = frame_bbox_1[3] - frame_bbox_1[1]
+    # if frame_text_2:
+    #     frame_bbox_2 = draw.textbbox((0, 0), frame_text_2, font=font_frame)
+    #     frame_height += (frame_bbox_2[3] - frame_bbox_2[1]) + 5  # Add second line height with spacing
+    frame_height = 0
     
     box_width = w - 40  # Full width minus margins (20px on each side)
     
@@ -409,10 +413,10 @@ def draw_caption(img, caption_data, alpha=1.0, font_size_title=70, font_size_des
     text_y += 5  # Extra spacing
     
     # Frame duration (two lines)
-    draw.text((text_x, text_y), frame_text_1, font=font_frame, fill=(80, 80, 80, text_alpha))
-    if frame_text_2:
-        text_y += frame_bbox_1[3] - frame_bbox_1[1] + 5  # Move to next line
-        draw.text((text_x, text_y), frame_text_2, font=font_frame, fill=(80, 80, 80, text_alpha))
+    # draw.text((text_x, text_y), frame_text_1, font=font_frame, fill=(80, 80, 80, text_alpha))
+    # if frame_text_2:
+    #     text_y += frame_bbox_1[3] - frame_bbox_1[1] + 5  # Move to next line
+    #     draw.text((text_x, text_y), frame_text_2, font=font_frame, fill=(80, 80, 80, text_alpha))
     
     # Composite PIL image onto OpenCV image
     img_pil_base = cv2_to_pil(img)
@@ -496,7 +500,8 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
 
     # Load captions if provided
     clips = []
-    if captions_json and segment_def_json:
+    # if captions_json and segment_def_json:
+    if captions_json:
         task_name = task_path.name  # e.g., '00_task'
         clips = load_captions(captions_json, segment_def_json, task_name)
         if clips:

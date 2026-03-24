@@ -3,7 +3,7 @@
 # Batch process all mp4 videos in example/clip_* with HaWoR
 # Results will be saved in example/clip_*/{video_name}/ directories
 
-CLIP1_DIR="example/clip_2"
+CLIP1_DIR="example/clip_3"
 LOG_FILE="$CLIP1_DIR/batch_process.log"
 
 # Create log file

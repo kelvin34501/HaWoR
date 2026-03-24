@@ -34,6 +34,6 @@ def process_segments(input_file, output_file):
     print(f"结果已保存到: {output_file}")
 
 if __name__ == "__main__":
-    input_file = "tmp/clip_1_seg.txt"
-    output_file = "tmp/clip_1_segment_def.json"
+    input_file = "tmp/clip_2_seg.txt"
+    output_file = "tmp/clip_2_segment_def.json"
     process_segments(input_file, output_file)
