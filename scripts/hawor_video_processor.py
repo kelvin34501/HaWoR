@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""Python API for single-video HaWoR annotation jobs.
+
+This module wraps the existing segmented pipeline in a server-friendly class:
+callers submit one video path and one output directory, while the class owns a
+thread-safe GPU pool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, Optional, Sequence, Union
+
+
+GpuIds = Union[str, Sequence[Union[int, str]]]
+
+
+@dataclass(frozen=True)
+class HaWoRProcessResult:
+    video_path: Path
+    output_dir: Path
+    work_dir: Path
+    log_path: Path
+    gpu_id: int
+    cam_space_dir: Path
+    slam_dir: Path
+    extracted_images_dir: Path
+    extracted_images_50fps_dir: Optional[Path]
+
+
+@dataclass(frozen=True)
+class HaWoRProcessorConfig:
+    project_dir: Path = Path(__file__).resolve().parents[1]
+    python_bin: str = sys.executable
+    segment_seconds: int = 100
+    min_last_segment_seconds: int = 60
+    split_mode: str = "reencode"
+    overlap_policy: str = "keep_last"
+    vis_mode: str = "off"
+    run_post_steps: bool = True
+    force_interpolate: bool = False
+    cleanup_intermediate: bool = True
+    overwrite_chunks: bool = False
+
+
+class GpuPool:
+    """Simple blocking GPU pool for worker threads."""
+
+    def __init__(self, gpu_ids: GpuIds = (0,)) -> None:
+        parsed = _parse_gpu_ids(gpu_ids)
+        if not parsed:
+            raise ValueError("gpu_ids must contain at least one GPU id")
+
+        self.gpu_ids = tuple(parsed)
+        self._available: "queue.Queue[int]" = queue.Queue()
+        for gpu_id in self.gpu_ids:
+            self._available.put(gpu_id)
+
+    @contextlib.contextmanager
+    def acquire(self) -> Iterator[int]:
+        gpu_id = self._available.get(block=True)
+        try:
+            yield gpu_id
+        finally:
+            self._available.put(gpu_id)
+
+    @property
+    def size(self) -> int:
+        return len(self.gpu_ids)
+
+
+class HaWoRVideoProcessor:
+    """Run HaWoR annotation for one video at a time per acquired GPU."""
+
+    def __init__(
+        self,
+        gpu_ids: GpuIds = (0,),
+        config: Optional[HaWoRProcessorConfig] = None,
+    ) -> None:
+        self.config = config or HaWoRProcessorConfig()
+        self.gpu_pool = GpuPool(gpu_ids)
+        self._validate_config()
+        self._log_lock = threading.Lock()
+
+    def process_video(
+        self,
+        video_path: Union[str, Path],
+        output_dir: Union[str, Path],
+        *,
+        overwrite_output: bool = False,
+    ) -> HaWoRProcessResult:
+        """Process one video and write annotation artifacts into output_dir.
+
+        The returned output directory contains the merged annotation artifacts:
+        cam_space/, SLAM/, extracted_images/, and optionally 50fps outputs.
+        This method blocks until a GPU is available.
+        """
+
+        video = Path(video_path).expanduser().resolve()
+        out_dir = Path(output_dir).expanduser().resolve()
+
+        if not video.is_file():
+            raise FileNotFoundError(f"Video file not found: {video}")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        work_dir = out_dir / "_segmented_work"
+        log_path = out_dir / "process.log"
+        if overwrite_output:
+            self._clear_known_outputs(out_dir, work_dir, log_path)
+
+        with self.gpu_pool.acquire() as gpu_id:
+            env = self._build_env(gpu_id)
+            self._run_segmented_pipeline(video, work_dir, log_path, gpu_id, env)
+            self._copy_merged_outputs(work_dir, out_dir, overwrite_output)
+
+            extracted_images_50fps_dir: Optional[Path] = None
+            if self.config.run_post_steps:
+                extracted_images_50fps_dir = out_dir / "extracted_images_50fps"
+                self._run_extract_50fps(video, extracted_images_50fps_dir, log_path, env)
+                self._run_interpolation(out_dir, log_path, env)
+            elif self.config.force_interpolate:
+                self._run_interpolation(out_dir, log_path, env)
+
+            if self.config.cleanup_intermediate and work_dir.exists():
+                shutil.rmtree(work_dir)
+
+            return HaWoRProcessResult(
+                video_path=video,
+                output_dir=out_dir,
+                work_dir=work_dir,
+                log_path=log_path,
+                gpu_id=gpu_id,
+                cam_space_dir=out_dir / "cam_space",
+                slam_dir=out_dir / "SLAM",
+                extracted_images_dir=out_dir / "extracted_images",
+                extracted_images_50fps_dir=extracted_images_50fps_dir,
+            )
+
+    def _validate_config(self) -> None:
+        if self.config.segment_seconds <= 0:
+            raise ValueError("segment_seconds must be positive")
+        if self.config.min_last_segment_seconds < 0:
+            raise ValueError("min_last_segment_seconds must be non-negative")
+        if self.config.split_mode not in {"copy", "reencode"}:
+            raise ValueError("split_mode must be 'copy' or 'reencode'")
+        if self.config.overlap_policy not in {"keep_last", "keep_first"}:
+            raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
+        if shutil.which(self.config.python_bin) is None:
+            raise FileNotFoundError(f"Python executable not found: {self.config.python_bin}")
+        if shutil.which("ffmpeg") is None:
+            raise FileNotFoundError("ffmpeg not found in PATH")
+
+    def _build_env(self, gpu_id: int) -> dict[str, str]:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        return env
+
+    def _run_segmented_pipeline(
+        self,
+        video: Path,
+        work_dir: Path,
+        log_path: Path,
+        gpu_id: int,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "segmented_demo_pipeline.py"
+        cmd = [
+            self.config.python_bin,
+            str(script),
+            "--video_path",
+            str(video),
+            "--segment_seconds",
+            str(self.config.segment_seconds),
+            "--min_last_segment_seconds",
+            str(self.config.min_last_segment_seconds),
+            "--overlap_policy",
+            self.config.overlap_policy,
+            "--vis_mode",
+            self.config.vis_mode,
+            "--gpu_id",
+            str(gpu_id),
+            "--work_dir",
+            str(work_dir),
+        ]
+        if self.config.split_mode == "reencode":
+            cmd.append("--reencode")
+        if self.config.overwrite_chunks:
+            cmd.append("--overwrite_chunks")
+
+        self._run_command(cmd, log_path, env)
+
+    def _copy_merged_outputs(
+        self,
+        work_dir: Path,
+        output_dir: Path,
+        overwrite_output: bool,
+    ) -> None:
+        merged_dir = work_dir / "merged"
+        if not merged_dir.is_dir():
+            raise FileNotFoundError(f"Merged output directory not found: {merged_dir}")
+
+        for name in ("cam_space", "SLAM", "extracted_images"):
+            src = merged_dir / name
+            if not src.exists():
+                continue
+
+            dst = output_dir / name
+            if dst.exists():
+                if overwrite_output:
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    else:
+                        dst.unlink()
+                else:
+                    raise FileExistsError(
+                        f"Output artifact already exists: {dst}. "
+                        "Use overwrite_output=True or a fresh output_dir."
+                    )
+
+            if src.is_dir():
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+    def _clear_known_outputs(self, output_dir: Path, work_dir: Path, log_path: Path) -> None:
+        paths = [
+            work_dir,
+            log_path,
+            output_dir / "cam_space",
+            output_dir / "cam_space_50fps",
+            output_dir / "SLAM",
+            output_dir / "extracted_images",
+            output_dir / "extracted_images_50fps",
+            output_dir / "world_space_res_50fps.pth",
+        ]
+
+        for path in paths:
+            if not path.exists():
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+    def _run_extract_50fps(
+        self,
+        video: Path,
+        output_folder: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "extract_image_50fps.py"
+        cmd = [
+            self.config.python_bin,
+            str(script),
+            "--video_path",
+            str(video),
+            "--output_folder",
+            str(output_folder),
+        ]
+        self._run_command(cmd, log_path, env)
+
+    def _run_interpolation(
+        self,
+        output_dir: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "interpolation.py"
+        cmd = [
+            self.config.python_bin,
+            str(script),
+            "--folder_path",
+            str(output_dir),
+        ]
+        self._run_command(cmd, log_path, env)
+
+    def _run_command(
+        self,
+        cmd: Sequence[str],
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(f"\n$ {' '.join(cmd)}\n")
+                log.flush()
+
+        with log_path.open("a", encoding="utf-8") as log:
+            proc = subprocess.run(
+                list(cmd),
+                cwd=self.config.project_dir,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Command failed with exit code {proc.returncode}. See log: {log_path}"
+            )
+
+
+def process_video(
+    video_path: Union[str, Path],
+    output_dir: Union[str, Path],
+    *,
+    gpu_ids: GpuIds = (0,),
+    config: Optional[HaWoRProcessorConfig] = None,
+    overwrite_output: bool = False,
+) -> HaWoRProcessResult:
+    """Convenience function for a one-off annotation job."""
+
+    return HaWoRVideoProcessor(gpu_ids=gpu_ids, config=config).process_video(
+        video_path,
+        output_dir,
+        overwrite_output=overwrite_output,
+    )
+
+
+def _parse_gpu_ids(gpu_ids: GpuIds) -> list[int]:
+    if isinstance(gpu_ids, str):
+        tokens = gpu_ids.replace(",", " ").split()
+    else:
+        tokens = [str(item) for item in gpu_ids]
+
+    parsed: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        if not token.isdigit():
+            raise ValueError(f"Invalid GPU id: {token}")
+        gpu_id = int(token)
+        if gpu_id in seen:
+            raise ValueError(f"Duplicate GPU id: {gpu_id}")
+        seen.add(gpu_id)
+        parsed.append(gpu_id)
+    return parsed
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run one HaWoR video annotation job")
+    parser.add_argument("--video_path", required=True, help="Input video path")
+    parser.add_argument("--output_dir", required=True, help="Directory for annotation outputs")
+    parser.add_argument("--gpu_ids", default="0", help='GPU pool, e.g. "0" or "0,1"')
+    parser.add_argument("--python_bin", default=sys.executable)
+    parser.add_argument("--segment_seconds", type=int, default=100)
+    parser.add_argument("--min_last_segment_seconds", type=int, default=60)
+    parser.add_argument("--split_mode", choices=["copy", "reencode"], default="reencode")
+    parser.add_argument("--overlap_policy", choices=["keep_last", "keep_first"], default="keep_last")
+    parser.add_argument("--vis_mode", default="off")
+    parser.add_argument("--no_post_steps", action="store_true")
+    parser.add_argument("--force_interpolate", action="store_true")
+    parser.add_argument("--keep_intermediate", action="store_true")
+    parser.add_argument("--overwrite_output", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = _build_arg_parser().parse_args()
+    config = HaWoRProcessorConfig(
+        python_bin=args.python_bin,
+        segment_seconds=args.segment_seconds,
+        min_last_segment_seconds=args.min_last_segment_seconds,
+        split_mode=args.split_mode,
+        overlap_policy=args.overlap_policy,
+        vis_mode=args.vis_mode,
+        run_post_steps=not args.no_post_steps,
+        force_interpolate=args.force_interpolate,
+        cleanup_intermediate=not args.keep_intermediate,
+    )
+    result = process_video(
+        args.video_path,
+        args.output_dir,
+        gpu_ids=args.gpu_ids,
+        config=config,
+        overwrite_output=args.overwrite_output,
+    )
+    print(f"Done: {result.output_dir}")
+    print(f"GPU: {result.gpu_id}")
+    print(f"Log: {result.log_path}")
+
+
+if __name__ == "__main__":
+    main()

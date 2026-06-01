@@ -36,7 +36,20 @@ def camera_marker_geometry(radius, height):
     return vertices, faces, face_colors
 
 
-def run_vis2_on_video(res_dict, res_dict2, output_pth, focal_length, image_names, R_c2w=None, t_c2w=None, interactive=True):
+def run_vis2_on_video(res_dict,
+                      res_dict2,
+                      output_pth,
+                      focal_length,
+                      image_names,
+                      R_c2w=None,
+                      t_c2w=None,
+                      interactive=True,
+                      show_traj=False,
+                      show_ghost=False,
+                      ghost_stride=35,
+                      ghost_count=4,
+                      ghost_alpha_decay=0.1,
+                      ghost_alpha_min=0.05):
     
     img0 = cv2.imread(image_names[0])
     height, width, _ = img0.shape
@@ -65,7 +78,59 @@ def run_vis2_on_video(res_dict, res_dict2, output_pth, focal_length, image_names
         }
         vis_dict[f"hand_{_id}"] = body_meshes
         color_idx += 1
-    
+        # add trajectory markers (dotted trail) for this hand (optional)
+        if show_traj:
+            traj = verts.mean(axis=1)  # (T, 3)
+            base_v, base_f, base_fc = camera_marker_geometry(0.01, 0.02)
+            nv = base_v.shape[0]
+            nf = base_f.shape[0]
+            all_v = []
+            all_f = []
+            all_fc = []
+            for i in range(traj.shape[0]):
+                offset = i * nv
+                v_i = base_v + traj[i][None, :]
+                f_i = base_f + offset
+                all_v.append(v_i)
+                all_f.append(f_i)
+                all_fc.append(base_fc)
+            all_v = np.concatenate(all_v, axis=0)  # (T*nv, 3)
+            all_f = np.concatenate(all_f, axis=0)  # (T*nf, 3)
+            all_fc = np.concatenate(all_fc, axis=0)  # (T*nf, 4)
+            T = verts.shape[0]
+            v3d_traj = np.tile(all_v[None, :, :], (T, 1, 1))
+            traj_mesh = {
+                "v3d": v3d_traj,
+                "f3d": all_f,
+                "vc": None,
+                "name": f"hand_{_id}_traj",
+                "fc": all_fc,
+                "color": -1,
+            }
+            vis_dict[f"hand_{_id}_traj"] = traj_mesh
+        # add ghost hands every few frames with fading color
+        if show_ghost:
+            base_rgba = np.array([0.804, 0.6, 0.820, 1.0], dtype=np.float32)
+            for g in range(1, ghost_count + 1):
+                lag = g * ghost_stride
+                ghost_v = []
+                for t in range(verts.shape[0]):
+                    src_idx = max(t - lag, 0)
+                    ghost_v.append(verts[src_idx])
+                ghost_v = np.stack(ghost_v, axis=0)
+                alpha = max(ghost_alpha_min, (ghost_alpha_decay**g) * base_rgba[3])
+                ghost_color = np.concatenate([base_rgba[:3], [alpha]], axis=0)
+                face_colors = np.tile(ghost_color[None, :], (body_faces.shape[0], 1))
+                ghost_mesh = {
+                    "v3d": ghost_v,
+                    "f3d": body_faces,
+                    "vc": None,
+                    "name": f"hand_{_id}_ghost_{g}",
+                    "fc": face_colors,
+                    "color": -1,
+                }
+                vis_dict[ghost_mesh["name"]] = ghost_mesh
+
     world_mano2['vertices'] = world_mano2['vertices']
     for _id, _verts in enumerate(world_mano2['vertices']):
         verts = _verts.cpu().numpy() # T, N, 3
@@ -80,7 +145,57 @@ def run_vis2_on_video(res_dict, res_dict2, output_pth, focal_length, image_names
         }
         vis_dict[f"hand2_{_id}"] = body_meshes
         color_idx += 1
-    
+        if show_traj:
+            traj = verts.mean(axis=1)  # (T, 3)
+            base_v, base_f, base_fc = camera_marker_geometry(0.01, 0.02)
+            nv = base_v.shape[0]
+            nf = base_f.shape[0]
+            all_v = []
+            all_f = []
+            all_fc = []
+            for i in range(traj.shape[0]):
+                offset = i * nv
+                v_i = base_v + traj[i][None, :]
+                f_i = base_f + offset
+                all_v.append(v_i)
+                all_f.append(f_i)
+                all_fc.append(base_fc)
+            all_v = np.concatenate(all_v, axis=0)
+            all_f = np.concatenate(all_f, axis=0)
+            all_fc = np.concatenate(all_fc, axis=0)
+            T = verts.shape[0]
+            v3d_traj = np.tile(all_v[None, :, :], (T, 1, 1))
+            traj_mesh = {
+                "v3d": v3d_traj,
+                "f3d": all_f,
+                "vc": None,
+                "name": f"hand2_{_id}_traj",
+                "fc": all_fc,
+                "color": -1,
+            }
+            vis_dict[f"hand2_{_id}_traj"] = traj_mesh
+        if show_ghost:
+            base_rgba = np.array([0.207, 0.596, 0.792, 1.0], dtype=np.float32)
+            for g in range(1, ghost_count + 1):
+                lag = g * ghost_stride
+                ghost_v = []
+                for t in range(verts.shape[0]):
+                    src_idx = max(t - lag, 0)
+                    ghost_v.append(verts[src_idx])
+                ghost_v = np.stack(ghost_v, axis=0)
+                alpha = max(ghost_alpha_min, (ghost_alpha_decay**g) * base_rgba[3])
+                ghost_color = np.concatenate([base_rgba[:3], [alpha]], axis=0)
+                face_colors = np.tile(ghost_color[None, :], (body_faces.shape[0], 1))
+                ghost_mesh = {
+                    "v3d": ghost_v,
+                    "f3d": body_faces,
+                    "vc": None,
+                    "name": f"hand2_{_id}_ghost_{g}",
+                    "fc": face_colors,
+                    "color": -1,
+                }
+                vis_dict[ghost_mesh["name"]] = ghost_mesh
+
     v, f, vc, fc = checkerboard_geometry(length=100, c1=0, c2=0, up="z")
     v[:, 2] -= 2 # z plane
     gound_meshes = {

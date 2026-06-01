@@ -132,6 +132,8 @@ def run_slam(imagedir, masks, calib=None, depth=None, stride=1,
     """ Maksed DROID-SLAM """
     droid = None
     depth = None
+    ##hack for passing args to droid
+    filter_thresh=1.5
     args.filter_thresh = filter_thresh
     args.disable_vis = disable_vis
     masks = masks[::stride]

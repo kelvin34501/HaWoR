@@ -1,6 +1,7 @@
 import argparse
 import sys
 import os
+import time
 
 import torch
 sys.path.insert(0, os.path.dirname(__file__))
@@ -17,25 +18,36 @@ from lib.vis.run_vis2 import run_vis2_on_video, run_vis2_on_video_cam
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_focal", type=float)
-    parser.add_argument("--video_path", type=str, default='example/video_0.mp4')
+    parser.add_argument("--video_path", type=str, default="example/clip_3_handonly/00.00.04.840-00.00.26.540--seg02.MP4")
     parser.add_argument("--input_type", type=str, default='file')
     parser.add_argument("--checkpoint",  type=str, default='./weights/hawor/checkpoints/hawor.ckpt')
     parser.add_argument("--infiller_weight",  type=str, default='./weights/hawor/checkpoints/infiller.pt')
-    parser.add_argument("--vis_mode",  type=str, default='world', help='off | cam | world')
+    parser.add_argument("--vis_mode",  type=str, default='world', help='cam | world')
     args = parser.parse_args()
 
+    start = time.perf_counter()
     start_idx, end_idx, seq_folder, imgfiles = detect_track_video(args)
+    elapsed = time.perf_counter() - start
+    print(f"Detection and tracking time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
 
+    start = time.perf_counter()
     frame_chunks_all, img_focal = hawor_motion_estimation(args, start_idx, end_idx, seq_folder)
+    elapsed = time.perf_counter() - start
+    print(f"Motion estimation time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
 
     slam_path = os.path.join(seq_folder, f"SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     if not os.path.exists(slam_path):
+        start = time.perf_counter()
         hawor_slam(args, start_idx, end_idx)
+        elapsed = time.perf_counter() - start
+        print(f"SLAM time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
     slam_path = os.path.join(seq_folder, f"SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     R_w2c_sla_all, t_w2c_sla_all, R_c2w_sla_all, t_c2w_sla_all = load_slam_cam(slam_path)
 
+    start = time.perf_counter()
     pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid = hawor_infiller(args, start_idx, end_idx, frame_chunks_all)
-
+    elapsed = time.perf_counter() - start
+    print(f"Infilling time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
     # vis sequence for this video
     hand2idx = {
         "right": 1,

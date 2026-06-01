@@ -108,6 +108,12 @@ def hawor_slam(args, start_idx, end_idx):
         pred_depth = cv2.resize(pred_depth, (W, H))
         pred_depths.append(pred_depth)
 
+    # save_path = f'{seq_folder}/depth'
+    # print('Saving predicted depth maps to ', save_path)
+    # os.makedirs(save_path, exist_ok=True)
+    # for i, depth in enumerate(pred_depths):
+    #     np.savez_compressed(f"{save_path}/depth_{i}.npz", depth=depth)
+
     ##### Estimate Metric Scale #####
     print('Estimating Metric Scale ...')
     scales_ = []

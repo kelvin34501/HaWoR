@@ -55,7 +55,8 @@ def detect_track_video(args):
         print(f"skip track for {start_idx}_{end_idx}")
         return start_idx, end_idx, seq_folder, imgfiles
     os.makedirs(f"{seq_folder}/tracks_{start_idx}_{end_idx}", exist_ok=True)
-    boxes_, tracks_ = detect_track(imgfiles, thresh=0.2)
+    # boxes_, tracks_ = detect_track(imgfiles, thresh=0.2)
+    boxes_, tracks_ = detect_track(imgfiles, thresh=0.3)
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_boxes.npy', boxes_)
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_tracks.npy', tracks_)
 
