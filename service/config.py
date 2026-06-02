@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
-
 GpuIds = Union[str, Sequence[Union[int, str]]]
 
 
@@ -14,8 +13,8 @@ GpuIds = Union[str, Sequence[Union[int, str]]]
 class ServiceConfig:
     cache_dir: Path
     gpu_ids: GpuIds
-    cleanup_intermediate: bool
-    keep_failed_cache: bool
+    keep_intermediate: bool
+    cleanup_failed_cache: bool
     host: str
     port: int
     max_workers: Optional[int] = None
@@ -25,15 +24,13 @@ def load_service_config(
     *,
     cache_dir: Optional[Union[str, Path]] = None,
     gpu_ids: Optional[GpuIds] = None,
-    cleanup_intermediate: Optional[bool] = None,
-    keep_failed_cache: Optional[bool] = None,
+    keep_intermediate: Optional[bool] = None,
+    cleanup_failed_cache: Optional[bool] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
     max_workers: Optional[int] = None,
 ) -> ServiceConfig:
-    resolved_cache_dir = Path(
-        cache_dir or os.getenv("HAWOR_CACHE_DIR", ".hawor_cache")
-    ).expanduser().resolve()
+    resolved_cache_dir = Path(cache_dir or os.getenv("HAWOR_CACHE_DIR", ".hawor_cache")).expanduser().resolve()
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
     _assert_writable_directory(resolved_cache_dir)
 
@@ -54,16 +51,10 @@ def load_service_config(
     return ServiceConfig(
         cache_dir=resolved_cache_dir,
         gpu_ids=gpu_ids or os.getenv("HAWOR_GPU_IDS", "0"),
-        cleanup_intermediate=(
-            cleanup_intermediate
-            if cleanup_intermediate is not None
-            else _parse_bool_env("HAWOR_CLEANUP_INTERMEDIATE", default=True)
-        ),
-        keep_failed_cache=(
-            keep_failed_cache
-            if keep_failed_cache is not None
-            else _parse_bool_env("HAWOR_KEEP_FAILED_CACHE", default=True)
-        ),
+        keep_intermediate=(keep_intermediate if keep_intermediate is not None else _parse_bool_env(
+            "HAWOR_KEEP_INTERMEDIATE", default=False)),
+        cleanup_failed_cache=(cleanup_failed_cache if cleanup_failed_cache is not None else _parse_bool_env(
+            "HAWOR_CLEANUP_FAILED_CACHE", default=False)),
         host=host or os.getenv("HAWOR_HOST", "0.0.0.0"),
         port=resolved_port,
         max_workers=resolved_max_workers,

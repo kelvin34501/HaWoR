@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from service.config import ServiceConfig, load_service_config
 from service.job_manager import JobManager, JobNotFoundError, JobNotReadyError
+from service.storage import DEFAULT_S3MOUNT_PREFIXES
 
 
 class AnnotateRequest(BaseModel):
@@ -25,13 +27,27 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
     config = service_config or load_service_config()
     job_manager = JobManager(config)
 
-    app = FastAPI(title="HaWoR Annotation Service", version="0.1.0")
-    app.state.job_manager = job_manager
-    app.state.service_config = config
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.job_manager = job_manager
+        app.state.service_config = config
+        try:
+            yield
+        finally:
+            job_manager.shutdown()
+
+    app = FastAPI(title="HaWoR Annotation Service", version="0.1.0", lifespan=lifespan)
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    def healthz() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "cache_dir": str(config.cache_dir),
+            "gpu_ids": str(config.gpu_ids),
+            "keep_intermediate": config.keep_intermediate,
+            "cleanup_failed_cache": config.cleanup_failed_cache,
+            "supported_s3mount_roots": [str(prefix) for prefix in DEFAULT_S3MOUNT_PREFIXES],
+        }
 
     @app.post("/v1/annotate")
     def create_annotation_job(payload: AnnotateRequest) -> dict:
@@ -63,9 +79,12 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
         except JobNotReadyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @app.on_event("shutdown")
-    def shutdown_event() -> None:
-        job_manager.shutdown()
+    @app.post("/v1/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str) -> dict:
+        try:
+            return job_manager.cancel_job(job_id)
+        except JobNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}") from exc
 
     return app
 
@@ -95,8 +114,8 @@ def main() -> None:
     config = load_service_config(
         cache_dir=args.cache_dir,
         gpu_ids=args.gpu_ids,
-        cleanup_intermediate=not args.keep_intermediate,
-        keep_failed_cache=not args.cleanup_failed_cache,
+        keep_intermediate=args.keep_intermediate,
+        cleanup_failed_cache=args.cleanup_failed_cache,
         host=args.host,
         port=args.port,
         max_workers=args.max_workers,
@@ -105,7 +124,6 @@ def main() -> None:
 
 
 app = create_app()
-
 
 if __name__ == "__main__":
     main()

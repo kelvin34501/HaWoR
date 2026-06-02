@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Union
 
-
 GpuIds = Union[str, Sequence[Union[int, str]]]
 
 
@@ -140,11 +139,8 @@ class HaWoRVideoProcessorForService:
                 cam_space_dir=out_dir / "cam_space",
                 slam_dir=out_dir / "SLAM",
                 extracted_images_dir=out_dir / "extracted_images",
-                extracted_images_50fps_dir=(
-                    out_dir / "extracted_images_50fps"
-                    if extracted_images_50fps_dir is not None
-                    else None
-                ),
+                extracted_images_50fps_dir=(out_dir / "extracted_images_50fps"
+                                            if extracted_images_50fps_dir is not None else None),
             )
 
     def _validate_config(self) -> None:
@@ -215,10 +211,8 @@ class HaWoRVideoProcessorForService:
             destination_path = destination_dir / source_path.name
             if destination_path.exists():
                 if not overwrite_output:
-                    raise FileExistsError(
-                        f"Output artifact already exists: {destination_path}. "
-                        "Use overwrite_output=True or a fresh output_dir."
-                    )
+                    raise FileExistsError(f"Output artifact already exists: {destination_path}. "
+                                          "Use overwrite_output=True or a fresh output_dir.")
                 if destination_path.is_dir():
                     shutil.rmtree(destination_path)
                 else:
@@ -308,9 +302,7 @@ class HaWoRVideoProcessorForService:
             )
 
         if proc.returncode != 0:
-            raise RuntimeError(
-                f"Command failed with exit code {proc.returncode}. See log: {log_path}"
-            )
+            raise RuntimeError(f"Command failed with exit code {proc.returncode}. See log: {log_path}")
 
 
 def _parse_gpu_ids(gpu_ids: GpuIds) -> list[int]:
