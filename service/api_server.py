@@ -44,7 +44,7 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
             "status": "ok",
             "cache_dir": str(config.cache_dir),
             "gpu_ids": str(config.gpu_ids),
-            "keep_intermediate": config.keep_intermediate,
+            "cleanup_intermediate": config.cleanup_intermediate,
             "cleanup_failed_cache": config.cleanup_failed_cache,
             "supported_s3mount_roots": [str(prefix) for prefix in DEFAULT_S3MOUNT_PREFIXES],
         }
@@ -97,9 +97,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-ids", default=None, help='GPU pool, e.g. "0" or "0,1"')
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument(
-        "--keep-intermediate",
-        action="store_true",
-        help="Keep per-video cache directories after successful completion",
+        "--cleanup-intermediate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Clean per-video cache directories after successful completion",
     )
     parser.add_argument(
         "--cleanup-failed-cache",
@@ -114,7 +115,7 @@ def main() -> None:
     config = load_service_config(
         cache_dir=args.cache_dir,
         gpu_ids=args.gpu_ids,
-        keep_intermediate=args.keep_intermediate,
+        cleanup_intermediate=args.cleanup_intermediate,
         cleanup_failed_cache=args.cleanup_failed_cache,
         host=args.host,
         port=args.port,

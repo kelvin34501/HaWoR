@@ -247,7 +247,7 @@ class JobManager:
             if canceled:
                 self._mark_pending_items_canceled(job_id)
 
-            should_cleanup_cache = ((not job_failed and not canceled and not self.config.keep_intermediate) or
+            should_cleanup_cache = (((not job_failed and not canceled) and self.config.cleanup_intermediate) or
                                     ((job_failed or canceled) and self.config.cleanup_failed_cache))
             if should_cleanup_cache and job_cache_dir.exists():
                 shutil.rmtree(job_cache_dir, ignore_errors=True)

@@ -13,7 +13,7 @@ GpuIds = Union[str, Sequence[Union[int, str]]]
 class ServiceConfig:
     cache_dir: Path
     gpu_ids: GpuIds
-    keep_intermediate: bool
+    cleanup_intermediate: bool
     cleanup_failed_cache: bool
     host: str
     port: int
@@ -24,7 +24,7 @@ def load_service_config(
     *,
     cache_dir: Optional[Union[str, Path]] = None,
     gpu_ids: Optional[GpuIds] = None,
-    keep_intermediate: Optional[bool] = None,
+    cleanup_intermediate: Optional[bool] = None,
     cleanup_failed_cache: Optional[bool] = None,
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -51,8 +51,8 @@ def load_service_config(
     return ServiceConfig(
         cache_dir=resolved_cache_dir,
         gpu_ids=gpu_ids or os.getenv("HAWOR_GPU_IDS", "0"),
-        keep_intermediate=(keep_intermediate if keep_intermediate is not None else _parse_bool_env(
-            "HAWOR_KEEP_INTERMEDIATE", default=False)),
+        cleanup_intermediate=(cleanup_intermediate if cleanup_intermediate is not None else _parse_bool_env(
+            "HAWOR_CLEANUP_INTERMEDIATE", default=True)),
         cleanup_failed_cache=(cleanup_failed_cache if cleanup_failed_cache is not None else _parse_bool_env(
             "HAWOR_CLEANUP_FAILED_CACHE", default=False)),
         host=host or os.getenv("HAWOR_HOST", "0.0.0.0"),
