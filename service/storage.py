@@ -17,6 +17,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 }
 SUPPORTED_VIS_MODES = {"off", "cam", "world"}
 DEFAULT_S3MOUNT_PREFIXES = (Path("/mnt/oss"),)
+S3_URL_SCHEME = "s3://"
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,42 @@ class JobPathPlan:
     input_dir: Path
     output_dir: Path
     video_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class S3Url:
+    """A parsed ``s3://bucket/key`` location.
+
+    ``prefix`` is the bucket-relative key path with surrounding slashes stripped
+    and may be empty when the URL points at the bucket root.
+    """
+
+    bucket: str
+    prefix: str
+
+    @classmethod
+    def from_url(cls, url: str) -> "S3Url":
+        """Parse an ``s3://bucket/path/to/videos`` URL into bucket and prefix.
+
+        Rejects empty values, non-``s3://`` schemes, missing buckets, and any
+        prefix that uses ``..`` to traverse out of the bucket.
+        """
+        raw = (url or "").strip()
+        if not raw:
+            raise ValueError("input_url must not be empty")
+        if not raw.lower().startswith(S3_URL_SCHEME):
+            raise ValueError(f"input_url must be an {S3_URL_SCHEME} URL, got: {url}")
+
+        remainder = raw[len(S3_URL_SCHEME):]
+        bucket, _, key = remainder.partition("/")
+        bucket = bucket.strip()
+        if not bucket:
+            raise ValueError(f"input_url is missing a bucket name: {url}")
+
+        prefix = key.strip("/")
+        if prefix and any(segment == ".." for segment in prefix.split("/")):
+            raise ValueError(f"input_url prefix must not contain '..' segments: {url}")
+        return cls(bucket=bucket, prefix=prefix)
 
 
 def build_job_path_plan(

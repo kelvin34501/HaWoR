@@ -10,20 +10,17 @@ from pydantic import BaseModel, Field
 
 from service.config import ServiceConfig, load_service_config
 from service.job_manager import JobManager, JobNotFoundError, JobNotReadyError
-from service.s3mount_manager import BucketBusyError, MountError, MountSpec
+from service.s3mount_manager import BucketBusyError, MountError
 
 
 class AnnotateRequest(BaseModel):
-    bucket: str = Field(..., description="Object-storage bucket name to mount")
+    input_url: str = Field(
+        ...,
+        description="s3://bucket/path link to the directory of input videos to mount",
+    )
     endpoint: str = Field(..., description="Object-storage endpoint URL")
     access_key: str = Field(..., description="Access key id (sensitive, never logged)")
     secret_key: str = Field(..., description="Secret access key (sensitive, never logged)")
-    input_subdir: str = Field(..., description="Bucket-relative input directory of videos")
-    output_subdir: Optional[str] = Field(
-        default=None,
-        description="Bucket-relative output directory; defaults to <input_subdir>_output",
-    )
-    prefix: Optional[str] = Field(default=None, description="Optional bucket prefix to mount")
     region: Optional[str] = Field(default=None, description="Optional region (e.g. oss-cn-beijing)")
     force_path_style: bool = Field(default=False, description="Set for domain-style endpoints")
     use_listobject_v2: bool = Field(default=False, description="Set for backends requiring ListObjectsV2")
@@ -60,21 +57,15 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
 
     @app.post("/v1/annotate", status_code=202)
     def create_annotation_job(payload: AnnotateRequest) -> dict:
-        mount_spec = MountSpec(
-            bucket=payload.bucket,
-            endpoint=payload.endpoint,
-            access_key=payload.access_key,
-            secret_key=payload.secret_key,
-            prefix=payload.prefix,
-            region=payload.region,
-            force_path_style=payload.force_path_style,
-            use_listobject_v2=payload.use_listobject_v2,
-        )
         try:
             return job_manager.create_job(
-                mount_spec=mount_spec,
-                input_subdir=payload.input_subdir,
-                output_subdir=payload.output_subdir,
+                input_url=payload.input_url,
+                endpoint=payload.endpoint,
+                access_key=payload.access_key,
+                secret_key=payload.secret_key,
+                region=payload.region,
+                force_path_style=payload.force_path_style,
+                use_listobject_v2=payload.use_listobject_v2,
                 vis_mode=payload.vis_mode,
                 overwrite=payload.overwrite,
             )

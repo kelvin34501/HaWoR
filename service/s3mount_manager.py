@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+#: Per-job mount point layout: ``<mount_root>/<job_id>/<JOB_INPUT_MOUNT_SUBDIR>``.
+JOB_INPUT_MOUNT_SUBDIR = "video_in"
+
 
 class MountError(RuntimeError):
     """Raised when a bucket cannot be mounted or becomes ready in time."""
@@ -96,7 +99,7 @@ class S3MountManager:
 
     def mount(self, job_id: str, spec: MountSpec) -> MountHandle:
         bucket_key = spec.bucket_key()
-        mount_dir = (self._mount_root / job_id).resolve()
+        mount_dir = (self._mount_root / job_id / JOB_INPUT_MOUNT_SUBDIR).resolve()
 
         with self._lock:
             if bucket_key in self._active:
@@ -268,4 +271,12 @@ class S3MountManager:
         try:
             mount_dir.rmdir()
         except OSError:
-            pass
+            return
+        # Remove the now-empty per-job parent directory (<mount_root>/<job_id>),
+        # but never the shared mount root itself.
+        parent = mount_dir.parent
+        if parent != self._mount_root.resolve():
+            try:
+                parent.rmdir()
+            except OSError:
+                pass

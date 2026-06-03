@@ -17,12 +17,15 @@ from service.hawor_video_processor_for_service import (
 from service.s3mount_manager import MountHandle, MountSpec, S3MountManager
 from service.storage import (
     JobPathPlan,
+    S3Url,
     build_job_path_plan,
-    default_output_subdir,
-    resolve_within_mount,
     validate_vis_mode,
     video_result_dir,
 )
+
+#: Output annotations live alongside the input videos inside the mounted prefix,
+#: i.e. ``<mount_root>/<job_id>/video_in/<JOB_OUTPUT_SUBDIR>``.
+JOB_OUTPUT_SUBDIR = "annotations"
 
 
 class JobNotFoundError(KeyError):
@@ -118,19 +121,34 @@ class JobManager:
     def create_job(
         self,
         *,
-        mount_spec: MountSpec,
-        input_subdir: str,
-        output_subdir: Optional[str],
+        input_url: str,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        region: Optional[str],
+        force_path_style: bool,
+        use_listobject_v2: bool,
         vis_mode: str,
         overwrite: bool,
     ) -> dict[str, Any]:
         normalized_vis_mode = validate_vis_mode(vis_mode)
+        s3_url = S3Url.from_url(input_url)
+        mount_spec = MountSpec(
+            bucket=s3_url.bucket,
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            prefix=s3_url.prefix,
+            region=region,
+            force_path_style=force_path_style,
+            use_listobject_v2=use_listobject_v2,
+            read_only=False,
+        )
         job_id = uuid.uuid4().hex
         mount_handle = self._mount_manager.mount(job_id, mount_spec)
         try:
-            input_dir = resolve_within_mount(mount_handle.mount_dir, input_subdir)
-            resolved_output_subdir = output_subdir or default_output_subdir(input_subdir)
-            output_dir = resolve_within_mount(mount_handle.mount_dir, resolved_output_subdir)
+            input_dir = mount_handle.mount_dir
+            output_dir = mount_handle.mount_dir / JOB_OUTPUT_SUBDIR
             plan = build_job_path_plan(
                 input_dir,
                 output_dir,
