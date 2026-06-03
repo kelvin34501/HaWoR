@@ -5,8 +5,9 @@ directory ``<mount_root>/<job_id>/`` using the ``s3mount`` binary, runs against
 bucket-relative paths, and unmounts when the job reaches a terminal state.
 
 Security notes:
-- Access/secret keys are written to a private ``0600`` credentials file that is
-  referenced by the s3mount child process through ``AWS_SHARED_CREDENTIALS_FILE``.
+- Access/secret keys are passed to the s3mount child process through the
+  ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` environment variables of
+  that child only, and are never inherited by anything else.
 - Secrets are never stored on the returned handle, logged, or echoed back.
 """
 
@@ -14,7 +15,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -71,7 +71,6 @@ class MountHandle:
     job_id: str
     mount_dir: Path
     bucket_key: str
-    _credentials_file: Path
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
 
 
@@ -108,15 +107,12 @@ class S3MountManager:
                 job_id=job_id,
                 mount_dir=mount_dir,
                 bucket_key=bucket_key,
-                _credentials_file=Path(),
             )
             self._active[bucket_key] = handle
 
         try:
             mount_dir.mkdir(parents=True, exist_ok=True)
-            credentials_file = self._write_credentials_file(spec)
-            handle._credentials_file = credentials_file
-            handle._process = self._spawn(spec, mount_dir, credentials_file)
+            handle._process = self._spawn(spec, mount_dir)
             self._wait_until_ready(handle)
             return handle
         except BaseException:
@@ -136,10 +132,9 @@ class S3MountManager:
         self,
         spec: MountSpec,
         mount_dir: Path,
-        credentials_file: Path,
     ) -> subprocess.Popen:
         argv = self._build_argv(spec, mount_dir)
-        env = self._build_env(credentials_file)
+        env = self._build_env(spec)
         try:
             return subprocess.Popen(
                 argv,
@@ -174,34 +169,19 @@ class S3MountManager:
                 argv += ["--metadata-ttl", str(self._cache_ttl_seconds)]
         return argv
 
-    def _build_env(self, credentials_file: Path) -> dict[str, str]:
+    def _build_env(self, spec: MountSpec) -> dict[str, str]:
         env = dict(os.environ)
         # Proxies break access to in-cluster object-storage endpoints.
         for name in _PROXY_ENV_VARS:
             env.pop(name, None)
-        # Force the child to read only the per-job credentials file and ignore
-        # any ambient AWS credentials in the environment.
-        env.pop("AWS_ACCESS_KEY_ID", None)
-        env.pop("AWS_SECRET_ACCESS_KEY", None)
+        # Pass the per-job credentials directly to the child process and ignore
+        # any ambient credentials file in the environment.
+        env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
+        env.pop("AWS_PROFILE", None)
         env.pop("AWS_SESSION_TOKEN", None)
-        env["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials_file)
-        env["AWS_PROFILE"] = "default"
+        env["AWS_ACCESS_KEY_ID"] = spec.access_key
+        env["AWS_SECRET_ACCESS_KEY"] = spec.secret_key
         return env
-
-    def _write_credentials_file(self, spec: MountSpec) -> Path:
-        fd, raw_path = tempfile.mkstemp(prefix="hawor_s3mount_", suffix=".credentials")
-        path = Path(raw_path)
-        try:
-            content = ("[default]\n"
-                       f"aws_access_key_id = {spec.access_key}\n"
-                       f"aws_secret_access_key = {spec.secret_key}\n")
-            with os.fdopen(fd, "w") as handle:
-                handle.write(content)
-        except BaseException:
-            path.unlink(missing_ok=True)
-            raise
-        os.chmod(path, 0o600)
-        return path
 
     def _wait_until_ready(self, handle: MountHandle) -> None:
         deadline = time.monotonic() + self._ready_timeout
@@ -241,9 +221,6 @@ class S3MountManager:
             except subprocess.TimeoutExpired:
                 process.kill()
         handle._process = None
-
-        if handle._credentials_file != Path():
-            handle._credentials_file.unlink(missing_ok=True)
 
         self._remove_empty_dir(handle.mount_dir)
 
