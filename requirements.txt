@@ -8,7 +8,7 @@ mmcv==1.3.9
 timm
 einops
 xtcocotools
-pandas
+pandas==2.3.2
 hydra-core
 hydra-submitit-launcher
 hydra-colorlog

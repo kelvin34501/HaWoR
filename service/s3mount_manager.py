@@ -135,6 +135,8 @@ class S3MountManager:
     ) -> subprocess.Popen:
         argv = self._build_argv(spec, mount_dir)
         env = self._build_env(spec)
+        # print(argv)
+        # print(env)
         try:
             return subprocess.Popen(
                 argv,
@@ -188,7 +190,8 @@ class S3MountManager:
         process = handle._process
         assert process is not None
         while time.monotonic() < deadline:
-            if process.poll() is not None:
+            err_code = process.poll()
+            if err_code is not None and err_code != 0:
                 raise MountError(self._mount_failure_message(handle))
             if os.path.ismount(handle.mount_dir):
                 return
