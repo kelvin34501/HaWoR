@@ -208,6 +208,7 @@ class HaWoRVideoProcessorForService:
             cmd.append("--reencode")
         if self.config.overwrite_chunks:
             cmd.append("--overwrite_chunks")
+        cmd.append("--skip_copy_back")
 
         self._run_command(cmd, log_path, env)
 

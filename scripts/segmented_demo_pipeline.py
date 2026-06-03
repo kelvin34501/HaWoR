@@ -669,44 +669,49 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
     )
 
     # Also place merged result under the original video seq folder for downstream tools.
-    orig_seq_dir = os.path.join(os.path.dirname(video_abs), seq_name_for_video(video_abs))
-    os.makedirs(orig_seq_dir, exist_ok=True)
-    target_dir = os.path.join(orig_seq_dir, args.output_subdir)
-    os.makedirs(target_dir, exist_ok=True)
+    # Skip when --skip_copy_back is set (e.g. service mode where the video lives on
+    # s3mount and shutil.copy2 / writes next to the video are both forbidden).
+    if not args.skip_copy_back:
+        orig_seq_dir = os.path.join(os.path.dirname(video_abs), seq_name_for_video(video_abs))
+        os.makedirs(orig_seq_dir, exist_ok=True)
+        target_dir = os.path.join(orig_seq_dir, args.output_subdir)
+        os.makedirs(target_dir, exist_ok=True)
 
-    for root, _, files in os.walk(merged_cam_dir):
-        for fn in files:
-            if not fn.endswith(".json"):
+        for root, _, files in os.walk(merged_cam_dir):
+            for fn in files:
+                if not fn.endswith(".json"):
+                    continue
+                fp = os.path.join(root, fn)
+                rel = os.path.relpath(fp, merged_cam_dir)
+                dst = os.path.join(target_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(fp, dst)
+                log(f"[copy ] {dst}")
+
+        if merged_slam_file is not None:
+            orig_slam_dir = os.path.join(orig_seq_dir, "SLAM")
+            os.makedirs(orig_slam_dir, exist_ok=True)
+            slam_dst = os.path.join(orig_slam_dir, os.path.basename(merged_slam_file))
+            shutil.copy2(merged_slam_file, slam_dst)
+            log(f"[copy ] {slam_dst}")
+
+        orig_img_dir = os.path.join(orig_seq_dir, "extracted_images")
+        os.makedirs(orig_img_dir, exist_ok=True)
+        for fn in sorted(os.listdir(merged_img_dir)) if os.path.isdir(merged_img_dir) else []:
+            src = os.path.join(merged_img_dir, fn)
+            if not os.path.isfile(src):
                 continue
-            fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, merged_cam_dir)
-            dst = os.path.join(target_dir, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(fp, dst)
+            dst = os.path.join(orig_img_dir, fn)
+            if os.path.exists(dst):
+                if args.overlap_policy == "keep_first":
+                    continue
+                os.remove(dst)
+            shutil.copy2(src, dst)
             log(f"[copy ] {dst}")
 
-    if merged_slam_file is not None:
-        orig_slam_dir = os.path.join(orig_seq_dir, "SLAM")
-        os.makedirs(orig_slam_dir, exist_ok=True)
-        slam_dst = os.path.join(orig_slam_dir, os.path.basename(merged_slam_file))
-        shutil.copy2(merged_slam_file, slam_dst)
-        log(f"[copy ] {slam_dst}")
-
-    orig_img_dir = os.path.join(orig_seq_dir, "extracted_images")
-    os.makedirs(orig_img_dir, exist_ok=True)
-    for fn in sorted(os.listdir(merged_img_dir)) if os.path.isdir(merged_img_dir) else []:
-        src = os.path.join(merged_img_dir, fn)
-        if not os.path.isfile(src):
-            continue
-        dst = os.path.join(orig_img_dir, fn)
-        if os.path.exists(dst):
-            if args.overlap_policy == "keep_first":
-                continue
-            os.remove(dst)
-        shutil.copy2(src, dst)
-        log(f"[copy ] {dst}")
-
-    log(f"[done ] merged cam_space available at: {target_dir}")
+        log(f"[done ] merged cam_space available at: {target_dir}")
+    else:
+        log(f"[done ] merged results at: {merged_root} (copy-back skipped)")
 
 
 def collect_videos(args: argparse.Namespace) -> List[str]:
@@ -749,6 +754,9 @@ def make_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--work_dir", type=str, default=None, help="Working directory (single-video mode recommended)")
     p.add_argument("--output_subdir", type=str, default="cam_space", help="Output subdir under original seq folder")
+    p.add_argument("--skip_copy_back", action="store_true",
+                   help="Skip copying merged results back to the original video sequence directory "
+                        "(required when the video lives on an s3mount target)")
     p.add_argument("--overlap_policy", choices=["keep_last", "keep_first"], default="keep_last")
 
     p.add_argument("--skip_split", action="store_true")
