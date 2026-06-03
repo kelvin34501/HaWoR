@@ -68,6 +68,36 @@ def build_job_path_plan(
     )
 
 
+def resolve_within_mount(mount_dir: str | Path, subpath: str) -> Path:
+    """Resolve a bucket-relative subpath to an absolute path inside ``mount_dir``.
+
+    Rejects absolute subpaths and any value that escapes the mount via ``..`` so a
+    request can only ever reach data inside its own per-job mount.
+    """
+    resolved_mount = Path(mount_dir).resolve()
+    raw = (subpath or "").strip()
+    if not raw:
+        raise ValueError("subpath must not be empty")
+    if raw.lower().startswith("s3://"):
+        raise ValueError("Native s3:// paths are not supported; provide a bucket-relative subpath")
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise ValueError(f"subpath must be relative to the bucket, got absolute path: {raw}")
+
+    resolved = (resolved_mount / candidate).resolve()
+    if not _is_relative_to(resolved, resolved_mount):
+        raise ValueError(f"subpath escapes the bucket mount: {raw}")
+    return resolved
+
+
+def default_output_subdir(input_subdir: str) -> str:
+    normalized = (input_subdir or "").strip().strip("/")
+    if not normalized:
+        raise ValueError("input_subdir must not be empty")
+    return f"{normalized}_output"
+
+
 def validate_vis_mode(vis_mode: str) -> str:
     normalized = vis_mode.strip().lower()
     if normalized not in SUPPORTED_VIS_MODES:

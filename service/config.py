@@ -17,6 +17,9 @@ class ServiceConfig:
     cleanup_failed_cache: bool
     host: str
     port: int
+    s3mount_bin: str
+    mount_root: Path
+    mount_ready_timeout: float
     max_workers: Optional[int] = None
 
 
@@ -29,10 +32,23 @@ def load_service_config(
     host: Optional[str] = None,
     port: Optional[int] = None,
     max_workers: Optional[int] = None,
+    s3mount_bin: Optional[str] = None,
+    mount_root: Optional[Union[str, Path]] = None,
+    mount_ready_timeout: Optional[float] = None,
 ) -> ServiceConfig:
     resolved_cache_dir = Path(cache_dir or os.getenv("HAWOR_CACHE_DIR", ".hawor_cache")).expanduser().resolve()
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
     _assert_writable_directory(resolved_cache_dir)
+
+    resolved_mount_root = Path(mount_root or os.getenv("HAWOR_MOUNT_ROOT", "/mnt/oss")).expanduser().resolve()
+    resolved_mount_root.mkdir(parents=True, exist_ok=True)
+    _assert_writable_directory(resolved_mount_root)
+
+    resolved_mount_ready_timeout = mount_ready_timeout
+    if resolved_mount_ready_timeout is None:
+        resolved_mount_ready_timeout = float(os.getenv("HAWOR_MOUNT_READY_TIMEOUT", "30"))
+    if resolved_mount_ready_timeout <= 0:
+        raise ValueError("mount_ready_timeout must be positive")
 
     resolved_port = port
     if resolved_port is None:
@@ -57,6 +73,9 @@ def load_service_config(
             "HAWOR_CLEANUP_FAILED_CACHE", default=False)),
         host=host or os.getenv("HAWOR_HOST", "0.0.0.0"),
         port=resolved_port,
+        s3mount_bin=s3mount_bin or os.getenv("HAWOR_S3MOUNT_BIN", "s3mount"),
+        mount_root=resolved_mount_root,
+        mount_ready_timeout=resolved_mount_ready_timeout,
         max_workers=resolved_max_workers,
     )
 

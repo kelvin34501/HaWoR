@@ -10,15 +10,23 @@ from pydantic import BaseModel, Field
 
 from service.config import ServiceConfig, load_service_config
 from service.job_manager import JobManager, JobNotFoundError, JobNotReadyError
-from service.storage import DEFAULT_S3MOUNT_PREFIXES
+from service.s3mount_manager import BucketBusyError, MountError, MountSpec
 
 
 class AnnotateRequest(BaseModel):
-    input_dir: str = Field(..., description="Non-recursive input directory of videos")
-    output_dir: Optional[str] = Field(
+    bucket: str = Field(..., description="Object-storage bucket name to mount")
+    endpoint: str = Field(..., description="Object-storage endpoint URL")
+    access_key: str = Field(..., description="Access key id (sensitive, never logged)")
+    secret_key: str = Field(..., description="Secret access key (sensitive, never logged)")
+    input_subdir: str = Field(..., description="Bucket-relative input directory of videos")
+    output_subdir: Optional[str] = Field(
         default=None,
-        description="Root output directory; defaults to sibling <input_dir>_output",
+        description="Bucket-relative output directory; defaults to <input_subdir>_output",
     )
+    prefix: Optional[str] = Field(default=None, description="Optional bucket prefix to mount")
+    region: Optional[str] = Field(default=None, description="Optional region (e.g. oss-cn-beijing)")
+    force_path_style: bool = Field(default=False, description="Set for domain-style endpoints")
+    use_listobject_v2: bool = Field(default=False, description="Set for backends requiring ListObjectsV2")
     vis_mode: str = Field(default="off", description="off | cam | world")
     overwrite: bool = Field(default=False, description="Overwrite existing per-video outputs")
 
@@ -46,18 +54,34 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
             "gpu_ids": str(config.gpu_ids),
             "cleanup_intermediate": config.cleanup_intermediate,
             "cleanup_failed_cache": config.cleanup_failed_cache,
-            "supported_s3mount_roots": [str(prefix) for prefix in DEFAULT_S3MOUNT_PREFIXES],
+            "mount_root": str(config.mount_root),
+            "mount_ready_timeout": config.mount_ready_timeout,
         }
 
-    @app.post("/v1/annotate")
+    @app.post("/v1/annotate", status_code=202)
     def create_annotation_job(payload: AnnotateRequest) -> dict:
+        mount_spec = MountSpec(
+            bucket=payload.bucket,
+            endpoint=payload.endpoint,
+            access_key=payload.access_key,
+            secret_key=payload.secret_key,
+            prefix=payload.prefix,
+            region=payload.region,
+            force_path_style=payload.force_path_style,
+            use_listobject_v2=payload.use_listobject_v2,
+        )
         try:
             return job_manager.create_job(
-                input_dir=payload.input_dir,
-                output_dir=payload.output_dir,
+                mount_spec=mount_spec,
+                input_subdir=payload.input_subdir,
+                output_subdir=payload.output_subdir,
                 vis_mode=payload.vis_mode,
                 overwrite=payload.overwrite,
             )
+        except BucketBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except MountError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (NotADirectoryError, PermissionError, FileExistsError, ValueError) as exc:
@@ -96,6 +120,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--gpu-ids", default=None, help='GPU pool, e.g. "0" or "0,1"')
     parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--s3mount-bin", default=None, help="Path to the s3mount binary")
+    parser.add_argument("--mount-root", default=None, help="Root directory for per-job bucket mounts")
+    parser.add_argument("--mount-ready-timeout",
+                        type=float,
+                        default=None,
+                        help="Seconds to wait for a bucket mount to become ready")
     parser.add_argument(
         "--cleanup-intermediate",
         action=argparse.BooleanOptionalAction,
@@ -120,6 +150,9 @@ def main() -> None:
         host=args.host,
         port=args.port,
         max_workers=args.max_workers,
+        s3mount_bin=args.s3mount_bin,
+        mount_root=args.mount_root,
+        mount_ready_timeout=args.mount_ready_timeout,
     )
     uvicorn.run(create_app(config), host=config.host, port=config.port)
 

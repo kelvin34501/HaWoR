@@ -14,7 +14,15 @@ from service.hawor_video_processor_for_service import (
     HaWoRProcessorConfig,
     HaWoRVideoProcessorForService,
 )
-from service.storage import JobPathPlan, build_job_path_plan, validate_vis_mode, video_result_dir
+from service.s3mount_manager import MountHandle, MountSpec, S3MountManager
+from service.storage import (
+    JobPathPlan,
+    build_job_path_plan,
+    default_output_subdir,
+    resolve_within_mount,
+    validate_vis_mode,
+    video_result_dir,
+)
 
 
 class JobNotFoundError(KeyError):
@@ -54,6 +62,7 @@ class JobRecord:
     error: Optional[str] = None
     cancel_requested: bool = False
     items: list[VideoItem] = field(default_factory=list)
+    mount_handle: Optional[MountHandle] = None
 
     @property
     def videos_done(self) -> int:
@@ -100,18 +109,38 @@ class JobManager:
             max_workers=requested_workers,
             thread_name_prefix="hawor-job",
         )
+        self._mount_manager = S3MountManager(
+            s3mount_bin=config.s3mount_bin,
+            mount_root=config.mount_root,
+            ready_timeout=config.mount_ready_timeout,
+        )
 
     def create_job(
         self,
         *,
-        input_dir: str,
-        output_dir: Optional[str],
+        mount_spec: MountSpec,
+        input_subdir: str,
+        output_subdir: Optional[str],
         vis_mode: str,
         overwrite: bool,
     ) -> dict[str, Any]:
         normalized_vis_mode = validate_vis_mode(vis_mode)
-        plan = build_job_path_plan(input_dir, output_dir, overwrite=overwrite)
         job_id = uuid.uuid4().hex
+        mount_handle = self._mount_manager.mount(job_id, mount_spec)
+        try:
+            input_dir = resolve_within_mount(mount_handle.mount_dir, input_subdir)
+            resolved_output_subdir = output_subdir or default_output_subdir(input_subdir)
+            output_dir = resolve_within_mount(mount_handle.mount_dir, resolved_output_subdir)
+            plan = build_job_path_plan(
+                input_dir,
+                output_dir,
+                overwrite=overwrite,
+                s3mount_prefixes=(self.config.mount_root,),
+            )
+        except BaseException:
+            self._mount_manager.unmount(mount_handle)
+            raise
+
         job = JobRecord(
             job_id=job_id,
             status="PENDING",
@@ -119,6 +148,7 @@ class JobManager:
             input_dir=str(plan.input_dir),
             output_dir=str(plan.output_dir),
             videos_total=len(plan.video_paths),
+            mount_handle=mount_handle,
             items=[
                 VideoItem(
                     video=video_path.name,
@@ -184,6 +214,15 @@ class JobManager:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=False)
 
+    def _unmount_job(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            handle = job.mount_handle if job is not None else None
+            if job is not None:
+                job.mount_handle = None
+        if handle is not None:
+            self._mount_manager.unmount(handle)
+
     def _run_job(
         self,
         job_id: str,
@@ -193,6 +232,7 @@ class JobManager:
     ) -> None:
         if self._is_cancel_requested(job_id):
             self._update_job(job_id, status="CANCELED", stage="CANCELED")
+            self._unmount_job(job_id)
             return
 
         self._update_job(job_id, status="RUNNING", stage="DISPATCHING")
@@ -263,6 +303,7 @@ class JobManager:
                 stage=final_status,
                 error=job_error,
             )
+            self._unmount_job(job_id)
 
     def _build_processor(self, vis_mode: str) -> HaWoRVideoProcessorForService:
         return HaWoRVideoProcessorForService(

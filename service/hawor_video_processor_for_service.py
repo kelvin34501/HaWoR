@@ -108,24 +108,31 @@ class HaWoRVideoProcessorForService:
 
         work_dir = scratch_root / "_segmented_work"
         staged_output_dir = scratch_root / "_final_output"
+        # The live log is append-written and used as subprocess stdout, which is
+        # unsupported on s3mount output targets. Keep it on local scratch and
+        # publish a single sequential copy to out_dir at the end.
+        live_log_path = scratch_root / "process.log"
         log_path = out_dir / "process.log"
         if overwrite_output:
             self._clear_known_outputs(out_dir, scratch_root, log_path)
 
         with self.gpu_pool.acquire() as gpu_id:
             env = self._build_env(gpu_id)
-            self._run_segmented_pipeline(video, work_dir, log_path, gpu_id, env)
-            self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
+            try:
+                self._run_segmented_pipeline(video, work_dir, live_log_path, gpu_id, env)
+                self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
 
-            extracted_images_50fps_dir: Optional[Path] = None
-            if self.config.run_post_steps:
-                extracted_images_50fps_dir = staged_output_dir / "extracted_images_50fps"
-                self._run_extract_50fps(video, extracted_images_50fps_dir, log_path, env)
-                self._run_interpolation(staged_output_dir, log_path, env)
-            elif self.config.force_interpolate:
-                self._run_interpolation(staged_output_dir, log_path, env)
+                extracted_images_50fps_dir: Optional[Path] = None
+                if self.config.run_post_steps:
+                    extracted_images_50fps_dir = staged_output_dir / "extracted_images_50fps"
+                    self._run_extract_50fps(video, extracted_images_50fps_dir, live_log_path, env)
+                    self._run_interpolation(staged_output_dir, live_log_path, env)
+                elif self.config.force_interpolate:
+                    self._run_interpolation(staged_output_dir, live_log_path, env)
 
-            self._copy_directory_contents(staged_output_dir, out_dir, overwrite_output=overwrite_output)
+                self._copy_directory_contents(staged_output_dir, out_dir, overwrite_output=overwrite_output)
+            finally:
+                self._publish_log(live_log_path, log_path)
 
             if self.config.cleanup_intermediate and scratch_root.exists():
                 shutil.rmtree(scratch_root)
@@ -219,9 +226,39 @@ class HaWoRVideoProcessorForService:
                     destination_path.unlink()
 
             if source_path.is_dir():
-                shutil.copytree(source_path, destination_path)
+                self._copy_tree_data_only(source_path, destination_path)
             else:
-                shutil.copy2(source_path, destination_path)
+                shutil.copyfile(source_path, destination_path)
+
+    def _copy_tree_data_only(self, source_dir: Path, destination_dir: Path) -> None:
+        """Recursively copy file data only.
+
+        Avoids ``shutil.copytree``/``copy2`` because they call ``copystat`` (chmod,
+        utimes, xattr), which is unsupported on s3mount targets and raises
+        ``PermissionError [Errno 1]``. Only directory creation and sequential file
+        writes are used here, which s3mount supports.
+        """
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(source_dir.iterdir()):
+            target = destination_dir / entry.name
+            if entry.is_dir():
+                self._copy_tree_data_only(entry, target)
+            else:
+                shutil.copyfile(entry, target)
+
+    def _publish_log(self, live_log_path: Path, final_log_path: Path) -> None:
+        """Copy the local scratch log to the (possibly s3mount) output directory.
+
+        Best-effort and metadata-free: a single sequential write, no append and no
+        ``copystat``. Failures here must not mask the original processing outcome.
+        """
+        if not live_log_path.is_file():
+            return
+        try:
+            final_log_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(live_log_path, final_log_path)
+        except OSError:
+            pass
 
     def _clear_known_outputs(self, output_dir: Path, scratch_root: Path, log_path: Path) -> None:
         paths = [
