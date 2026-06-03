@@ -19,6 +19,7 @@ from service.storage import (
     JobPathPlan,
     S3Url,
     build_job_path_plan,
+    classify_storage_path,
     validate_vis_mode,
     video_result_dir,
 )
@@ -258,6 +259,14 @@ class JobManager:
         job_cache_dir = self.config.cache_dir / job_id
         job_cache_dir.mkdir(parents=True, exist_ok=True)
 
+        output_access = classify_storage_path(
+            plan.output_dir,
+            s3mount_prefixes=(self.config.mount_root,),
+        )
+        # Pre-clearing output artifacts requires delete support; s3mount targets
+        # typically lack it, so skip _clear_known_outputs for them.
+        clear_on_overwrite = output_access != "s3mount"
+
         job_failed = False
         job_error: Optional[str] = None
         pending_videos = iter(plan.video_paths)
@@ -271,6 +280,7 @@ class JobManager:
                 plan.output_dir,
                 job_cache_dir,
                 overwrite,
+                clear_on_overwrite,
             )
 
             while futures:
@@ -295,6 +305,7 @@ class JobManager:
                     plan.output_dir,
                     job_cache_dir,
                     overwrite,
+                    clear_on_overwrite,
                 )
         except Exception as exc:
             job_failed = True
@@ -340,6 +351,7 @@ class JobManager:
         output_dir: Path,
         scratch_dir: Path,
         overwrite: bool,
+        clear_on_overwrite: bool,
     ) -> None:
         self._set_video_status(job_id, video_path.name, "RUNNING")
         self._update_job(job_id, stage="PROCESSING")
@@ -348,6 +360,7 @@ class JobManager:
             output_dir,
             scratch_dir=scratch_dir,
             overwrite_output=overwrite,
+            clear_on_overwrite=clear_on_overwrite,
         )
 
     def _mark_video_succeeded(self, job_id: str, video_path: Path) -> None:
@@ -414,6 +427,7 @@ class JobManager:
         output_root: Path,
         job_cache_dir: Path,
         overwrite: bool,
+        clear_on_overwrite: bool,
     ) -> None:
         while len(futures) < self._dispatch_limit and not self._is_cancel_requested(job_id):
             try:
@@ -429,6 +443,7 @@ class JobManager:
                 video_result_dir(output_root, video_path),
                 job_cache_dir / video_path.stem,
                 overwrite,
+                clear_on_overwrite,
             )
             futures[future] = video_path
 

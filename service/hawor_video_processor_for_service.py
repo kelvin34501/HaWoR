@@ -95,7 +95,15 @@ class HaWoRVideoProcessorForService:
         *,
         scratch_dir: Union[str, Path],
         overwrite_output: bool = False,
+        clear_on_overwrite: bool = True,
     ) -> HaWoRProcessResult:
+        """Process a single video.
+
+        Args:
+            clear_on_overwrite: When *overwrite_output* is True, pre-clear known
+                output artifacts before the run.  Set to ``False`` for s3mount
+                output directories where delete operations are unsupported.
+        """
         video = Path(video_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
         scratch_root = Path(scratch_dir).expanduser().resolve()
@@ -113,7 +121,7 @@ class HaWoRVideoProcessorForService:
         # publish a single sequential copy to out_dir at the end.
         live_log_path = scratch_root / "process.log"
         log_path = out_dir / "process.log"
-        if overwrite_output:
+        if overwrite_output and clear_on_overwrite:
             self._clear_known_outputs(out_dir, scratch_root, log_path)
 
         with self.gpu_pool.acquire() as gpu_id:
@@ -216,15 +224,13 @@ class HaWoRVideoProcessorForService:
         destination_dir.mkdir(parents=True, exist_ok=True)
         for source_path in sorted(source_dir.iterdir()):
             destination_path = destination_dir / source_path.name
-            if destination_path.exists():
-                if not overwrite_output:
-                    raise FileExistsError(f"Output artifact already exists: {destination_path}. "
-                                          "Use overwrite_output=True or a fresh output_dir.")
-                if destination_path.is_dir():
-                    shutil.rmtree(destination_path)
-                else:
-                    destination_path.unlink()
+            if destination_path.exists() and not overwrite_output:
+                raise FileExistsError(f"Output artifact already exists: {destination_path}. "
+                                      "Use overwrite_output=True or a fresh output_dir.")
 
+            # No pre-delete: shutil.copyfile overwrites on local filesystems and on
+            # s3mount targets with --allow-overwrite. _copy_tree_data_only uses
+            # exist_ok=True and per-file copyfile so it is safe for both.
             if source_path.is_dir():
                 self._copy_tree_data_only(source_path, destination_path)
             else:
@@ -261,8 +267,14 @@ class HaWoRVideoProcessorForService:
             pass
 
     def _clear_known_outputs(self, output_dir: Path, scratch_root: Path, log_path: Path) -> None:
-        paths = [
-            scratch_root,
+        # Clear local scratch unconditionally; this also removes any live log inside it.
+        if scratch_root.exists():
+            shutil.rmtree(scratch_root)
+        scratch_root.mkdir(parents=True, exist_ok=True)
+
+        # Best-effort removal of previous out_dir artifacts. Silently skips paths
+        # that cannot be deleted (e.g. s3mount targets without --allow-delete).
+        out_paths = [
             log_path,
             output_dir / "cam_space",
             output_dir / "cam_space_50fps",
@@ -272,16 +284,16 @@ class HaWoRVideoProcessorForService:
             output_dir / "world_space_res.pth",
             output_dir / "world_space_res_50fps.pth",
         ]
-
-        for path in paths:
+        for path in out_paths:
             if not path.exists():
                 continue
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-
-        scratch_root.mkdir(parents=True, exist_ok=True)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError:
+                pass
 
     def _run_extract_50fps(
         self,
