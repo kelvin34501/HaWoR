@@ -21,6 +21,7 @@ class ServiceConfig:
     mount_root: Path
     mount_ready_timeout: float
     max_workers: Optional[int] = None
+    jobs_per_gpu: int = 1
 
 
 def load_service_config(
@@ -32,6 +33,7 @@ def load_service_config(
     host: Optional[str] = None,
     port: Optional[int] = None,
     max_workers: Optional[int] = None,
+    jobs_per_gpu: Optional[int] = None,
     s3mount_bin: Optional[str] = None,
     mount_root: Optional[Union[str, Path]] = None,
     mount_ready_timeout: Optional[float] = None,
@@ -64,6 +66,13 @@ def load_service_config(
     if resolved_max_workers is not None and resolved_max_workers <= 0:
         raise ValueError("max_workers must be positive when provided")
 
+    resolved_jobs_per_gpu = jobs_per_gpu
+    if resolved_jobs_per_gpu is None:
+        raw_jobs_per_gpu = os.getenv("HAWOR_JOBS_PER_GPU")
+        resolved_jobs_per_gpu = int(raw_jobs_per_gpu) if raw_jobs_per_gpu else 1
+    if resolved_jobs_per_gpu < 1:
+        raise ValueError("jobs_per_gpu must be >= 1")
+
     return ServiceConfig(
         cache_dir=resolved_cache_dir,
         gpu_ids=gpu_ids or os.getenv("HAWOR_GPU_IDS", "0"),
@@ -77,6 +86,7 @@ def load_service_config(
         mount_root=resolved_mount_root,
         mount_ready_timeout=resolved_mount_ready_timeout,
         max_workers=resolved_max_workers,
+        jobs_per_gpu=resolved_jobs_per_gpu,
     )
 
 

@@ -2,6 +2,7 @@
 
 export HAWOR_CACHE_DIR=./example/hawor_process
 export HAWOR_GPU_IDS=0
+# export HAWOR_JOBS_PER_GPU=1   # max concurrent jobs per GPU (default 1)
 export HAWOR_CLEANUP_INTERMEDIATE=true
 export HAWOR_CLEANUP_FAILED_CACHE=false
 export HAWOR_S3MOUNT_BIN=/mnt/petrelfs/share/s3mount

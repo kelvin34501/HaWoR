@@ -106,7 +106,7 @@ class JobManager:
         self.config = config
         self._jobs: dict[str, JobRecord] = {}
         self._lock = threading.RLock()
-        self._gpu_pool = GpuPool(config.gpu_ids)
+        self._gpu_pool = GpuPool(config.gpu_ids, jobs_per_gpu=config.jobs_per_gpu)
         requested_workers = config.max_workers or self._gpu_pool.size
         self._dispatch_limit = max(1, min(requested_workers, self._gpu_pool.size))
         self._executor = ThreadPoolExecutor(

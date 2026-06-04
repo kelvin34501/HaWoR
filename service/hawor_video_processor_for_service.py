@@ -51,15 +51,19 @@ class HaWoRProcessorConfig:
 class GpuPool:
     """Simple blocking GPU pool for worker threads."""
 
-    def __init__(self, gpu_ids: GpuIds = (0,)) -> None:
+    def __init__(self, gpu_ids: GpuIds = (0,), jobs_per_gpu: int = 1) -> None:
         parsed = _parse_gpu_ids(gpu_ids)
         if not parsed:
             raise ValueError("gpu_ids must contain at least one GPU id")
+        if jobs_per_gpu < 1:
+            raise ValueError("jobs_per_gpu must be >= 1")
 
         self.gpu_ids = tuple(parsed)
+        self._jobs_per_gpu = jobs_per_gpu
         self._available: "queue.Queue[int]" = queue.Queue()
         for gpu_id in self.gpu_ids:
-            self._available.put(gpu_id)
+            for _ in range(jobs_per_gpu):
+                self._available.put(gpu_id)
 
     @contextlib.contextmanager
     def acquire(self) -> Iterator[int]:
@@ -71,7 +75,7 @@ class GpuPool:
 
     @property
     def size(self) -> int:
-        return len(self.gpu_ids)
+        return len(self.gpu_ids) * self._jobs_per_gpu
 
 
 class HaWoRVideoProcessorForService:
