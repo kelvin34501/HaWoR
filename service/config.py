@@ -22,6 +22,7 @@ class ServiceConfig:
     mount_ready_timeout: float
     max_workers: Optional[int] = None
     jobs_per_gpu: int = 1
+    copy_extracted_images: bool = True
 
 
 def load_service_config(
@@ -34,6 +35,7 @@ def load_service_config(
     port: Optional[int] = None,
     max_workers: Optional[int] = None,
     jobs_per_gpu: Optional[int] = None,
+    copy_extracted_images: Optional[bool] = None,
     s3mount_bin: Optional[str] = None,
     mount_root: Optional[Union[str, Path]] = None,
     mount_ready_timeout: Optional[float] = None,
@@ -87,6 +89,8 @@ def load_service_config(
         mount_ready_timeout=resolved_mount_ready_timeout,
         max_workers=resolved_max_workers,
         jobs_per_gpu=resolved_jobs_per_gpu,
+        copy_extracted_images=(copy_extracted_images if copy_extracted_images is not None else _parse_bool_env(
+            "HAWOR_COPY_EXTRACTED_IMAGES", default=True)),
     )
 
 

@@ -26,6 +26,7 @@ export HAWOR_CACHE_DIR=./example/data_nvme/hawor_process
 export HAWOR_GPU_IDS=0,1
 export HAWOR_CLEANUP_INTERMEDIATE=true
 export HAWOR_CLEANUP_FAILED_CACHE=false
+export HAWOR_COPY_EXTRACTED_IMAGES=false
 export HAWOR_S3MOUNT_BIN=/mnt/petrelfs/share_data/s3mount
 export HAWOR_MOUNT_ROOT=/mnt/oss
 export HAWOR_MOUNT_READY_TIMEOUT=30
@@ -38,6 +39,7 @@ Common startup options:
 - `--gpu-ids`: GPU pool definition such as `0` or `0,1`.
 - `--cleanup-intermediate` / `--no-cleanup-intermediate`: control whether successful job cache directories are deleted.
 - `--cleanup-failed-cache`: delete failed job cache directories instead of preserving them for debugging.
+- `--copy-extracted-images` / `--no-copy-extracted-images`: whether to copy `extracted_images` and `extracted_images_50fps` frame directories to the output directory. Disable to save storage when raw frames are not needed (default: enabled). Environment variable: `HAWOR_COPY_EXTRACTED_IMAGES`.
 - `--s3mount-bin`: path to the `s3mount` binary (default `s3mount` on `PATH`).
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).

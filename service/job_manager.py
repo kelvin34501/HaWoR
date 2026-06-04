@@ -339,6 +339,7 @@ class JobManager:
             config=HaWoRProcessorConfig(
                 vis_mode=vis_mode,
                 cleanup_intermediate=False,
+                copy_extracted_images=self.config.copy_extracted_images,
             ),
             gpu_pool=self._gpu_pool,
         )

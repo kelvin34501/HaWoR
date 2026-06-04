@@ -46,6 +46,7 @@ class HaWoRProcessorConfig:
     force_interpolate: bool = False
     cleanup_intermediate: bool = True
     overwrite_chunks: bool = False
+    copy_extracted_images: bool = True
 
 
 class GpuPool:
@@ -142,7 +143,13 @@ class HaWoRVideoProcessorForService:
                 elif self.config.force_interpolate:
                     self._run_interpolation(staged_output_dir, live_log_path, env)
 
-                self._copy_directory_contents(staged_output_dir, out_dir, overwrite_output=overwrite_output)
+                exclude: frozenset[str] = frozenset()
+                if not self.config.copy_extracted_images:
+                    exclude = frozenset({"extracted_images", "extracted_images_50fps"})
+                self._copy_directory_contents(staged_output_dir,
+                                              out_dir,
+                                              overwrite_output=overwrite_output,
+                                              exclude=exclude)
             finally:
                 self._publish_log(live_log_path, log_path)
 
@@ -217,17 +224,20 @@ class HaWoRVideoProcessorForService:
         self._run_command(cmd, log_path, env)
 
     def _copy_directory_contents(
-        self,
-        source_dir: Path,
-        destination_dir: Path,
-        *,
-        overwrite_output: bool,
+            self,
+            source_dir: Path,
+            destination_dir: Path,
+            *,
+            overwrite_output: bool,
+            exclude: frozenset[str] = frozenset(),
     ) -> None:
         if not source_dir.is_dir():
             raise FileNotFoundError(f"Directory not found: {source_dir}")
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         for source_path in sorted(source_dir.iterdir()):
+            if source_path.name in exclude:
+                continue
             destination_path = destination_dir / source_path.name
             if destination_path.exists() and not overwrite_output:
                 raise FileExistsError(f"Output artifact already exists: {destination_path}. "

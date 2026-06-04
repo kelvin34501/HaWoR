@@ -128,6 +128,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete failed job cache directories instead of keeping them for debugging",
     )
+    parser.add_argument(
+        "--copy-extracted-images",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Copy extracted_images / extracted_images_50fps frames to the output directory (default: true)",
+    )
     return parser
 
 
@@ -138,6 +144,7 @@ def main() -> None:
         gpu_ids=args.gpu_ids,
         cleanup_intermediate=args.cleanup_intermediate,
         cleanup_failed_cache=args.cleanup_failed_cache,
+        copy_extracted_images=args.copy_extracted_images,
         host=args.host,
         port=args.port,
         max_workers=args.max_workers,
