@@ -287,6 +287,7 @@ class JobManager:
                 done, _ = wait(set(futures.keys()), return_when=FIRST_COMPLETED)
                 for future in done:
                     video_path = futures.pop(future)
+                    video_scratch = job_cache_dir / video_path.stem
                     try:
                         future.result()
                     except Exception as exc:
@@ -294,8 +295,16 @@ class JobManager:
                         if job_error is None:
                             job_error = str(exc)
                         self._mark_video_failed(job_id, video_path, str(exc))
+                        if self.config.cleanup_failed_cache and video_scratch.exists():
+                            shutil.rmtree(video_scratch, ignore_errors=True)
                     else:
                         self._mark_video_succeeded(job_id, video_path)
+                        # Eagerly reclaim per-video scratch space as each video
+                        # finishes, instead of waiting for the entire job to
+                        # complete. This prevents disk exhaustion when a job
+                        # contains thousands of videos.
+                        if video_scratch.exists():
+                            shutil.rmtree(video_scratch, ignore_errors=True)
 
                 self._fill_inflight(
                     job_id,
