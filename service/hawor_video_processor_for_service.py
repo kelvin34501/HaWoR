@@ -116,7 +116,6 @@ class HaWoRVideoProcessorForService:
         if not video.is_file():
             raise FileNotFoundError(f"Video file not found: {video}")
 
-        out_dir.mkdir(parents=True, exist_ok=True)
         scratch_root.mkdir(parents=True, exist_ok=True)
 
         work_dir = scratch_root / "_segmented_work"
@@ -146,10 +145,12 @@ class HaWoRVideoProcessorForService:
                 exclude: frozenset[str] = frozenset()
                 if not self.config.copy_extracted_images:
                     exclude = frozenset({"extracted_images", "extracted_images_50fps"})
+                out_dir.mkdir(parents=True, exist_ok=True)
                 self._copy_directory_contents(staged_output_dir,
                                               out_dir,
                                               overwrite_output=overwrite_output,
                                               exclude=exclude)
+                self._write_success_sentinel(out_dir, scratch_root)
             finally:
                 self._publish_log(live_log_path, log_path)
 
@@ -309,6 +310,21 @@ class HaWoRVideoProcessorForService:
                     path.unlink()
             except OSError:
                 pass
+
+    def _write_success_sentinel(self, out_dir: Path, scratch_root: Path) -> None:
+        """Write a process.success sentinel to *out_dir* (best-effort, s3mount-safe).
+
+        Mirrors _publish_log: create a local file on scratch first, then copy
+        sequentially to the (possibly s3mount) output directory.  Failures are
+        silently swallowed so the sentinel never masks the actual processing result.
+        """
+        local_sentinel = scratch_root / "process.success"
+        remote_sentinel = out_dir / "process.success"
+        try:
+            local_sentinel.write_text("")
+            shutil.copyfile(local_sentinel, remote_sentinel)
+        except OSError:
+            pass
 
     def _run_extract_50fps(
         self,

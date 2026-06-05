@@ -26,6 +26,10 @@ class AnnotateRequest(BaseModel):
     use_listobject_v2: bool = Field(default=False, description="Set for backends requiring ListObjectsV2")
     vis_mode: str = Field(default="off", description="off | cam | world")
     overwrite: bool = Field(default=False, description="Overwrite existing per-video outputs")
+    skip_processed: bool = Field(
+        default=False,
+        description="Skip videos whose output already contains a process.success sentinel",
+    )
 
 
 def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
@@ -68,6 +72,7 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
                 use_listobject_v2=payload.use_listobject_v2,
                 vis_mode=payload.vis_mode,
                 overwrite=payload.overwrite,
+                skip_processed=payload.skip_processed,
             )
         except BucketBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

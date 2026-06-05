@@ -18,6 +18,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 SUPPORTED_VIS_MODES = {"off", "cam", "world"}
 DEFAULT_S3MOUNT_PREFIXES = (Path("/mnt/oss"),)
 S3_URL_SCHEME = "s3://"
+PROCESS_SUCCESS_FILENAME = "process.success"
 
 
 @dataclass(frozen=True)
@@ -170,6 +171,11 @@ def scan_videos(input_dir: Path) -> Iterable[Path]:
 
 def video_result_dir(output_dir: Path, video_path: Path) -> Path:
     return output_dir / video_path.stem
+
+
+def is_video_processed(output_dir: Path, video_path: Path) -> bool:
+    """Return True iff the video's result directory contains a success sentinel."""
+    return (video_result_dir(output_dir, video_path) / PROCESS_SUCCESS_FILENAME).exists()
 
 
 def _ensure_output_root_ready(output_dir: Path) -> None:

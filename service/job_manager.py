@@ -20,6 +20,7 @@ from service.storage import (
     S3Url,
     build_job_path_plan,
     classify_storage_path,
+    is_video_processed,
     validate_vis_mode,
     video_result_dir,
 )
@@ -77,10 +78,14 @@ class JobRecord:
         return sum(1 for item in self.items if item.status == "FAILED")
 
     @property
+    def videos_skipped(self) -> int:
+        return sum(1 for item in self.items if item.status == "SKIPPED")
+
+    @property
     def progress(self) -> int:
         if self.videos_total == 0:
             return 0
-        terminal = sum(1 for item in self.items if item.status in {"SUCCEEDED", "FAILED", "CANCELED"})
+        terminal = sum(1 for item in self.items if item.status in {"SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"})
         return int((terminal / self.videos_total) * 100)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +97,7 @@ class JobRecord:
             "videos_total": self.videos_total,
             "videos_done": self.videos_done,
             "videos_failed": self.videos_failed,
+            "videos_skipped": self.videos_skipped,
             "input_dir": self.input_dir,
             "output_dir": self.output_dir,
             "error": self.error,
@@ -131,6 +137,7 @@ class JobManager:
         use_listobject_v2: bool,
         vis_mode: str,
         overwrite: bool,
+        skip_processed: bool,
     ) -> dict[str, Any]:
         normalized_vis_mode = validate_vis_mode(vis_mode)
         s3_url = S3Url.from_url(input_url)
@@ -150,15 +157,27 @@ class JobManager:
         try:
             input_dir = mount_handle.mount_dir
             output_dir = mount_handle.mount_dir / JOB_OUTPUT_SUBDIR
+            # When skip_processed=True, result dirs of already-processed videos
+            # exist and would fail _validate_existing_results with overwrite=False.
+            # Pass overwrite=True to bypass that upfront check; per-video processing
+            # still uses the caller's overwrite value for unprocessed videos.
+            plan_overwrite = True if skip_processed else overwrite
             plan = build_job_path_plan(
                 input_dir,
                 output_dir,
-                overwrite=overwrite,
+                overwrite=plan_overwrite,
                 s3mount_prefixes=(self.config.mount_root,),
             )
         except BaseException:
             self._mount_manager.unmount(mount_handle)
             raise
+
+        if skip_processed:
+            skip_set = frozenset(v for v in plan.video_paths if is_video_processed(plan.output_dir, v))
+            process_videos: tuple[Path, ...] = tuple(v for v in plan.video_paths if v not in skip_set)
+        else:
+            skip_set = frozenset()
+            process_videos = plan.video_paths
 
         job = JobRecord(
             job_id=job_id,
@@ -171,7 +190,7 @@ class JobManager:
             items=[
                 VideoItem(
                     video=video_path.name,
-                    status="PENDING",
+                    status="SKIPPED" if video_path in skip_set else "PENDING",
                     result_dir=str(video_result_dir(plan.output_dir, video_path)),
                     log_path=str(video_result_dir(plan.output_dir, video_path) / "process.log"),
                 ) for video_path in plan.video_paths
@@ -183,7 +202,7 @@ class JobManager:
 
         runner = threading.Thread(
             target=self._run_job,
-            args=(job_id, plan, normalized_vis_mode, overwrite),
+            args=(job_id, plan, normalized_vis_mode, overwrite, process_videos),
             daemon=True,
             name=f"hawor-job-{job_id}",
         )
@@ -248,6 +267,7 @@ class JobManager:
         plan: JobPathPlan,
         vis_mode: str,
         overwrite: bool,
+        video_paths: tuple[Path, ...],
     ) -> None:
         if self._is_cancel_requested(job_id):
             self._update_job(job_id, status="CANCELED", stage="CANCELED")
@@ -269,7 +289,7 @@ class JobManager:
 
         job_failed = False
         job_error: Optional[str] = None
-        pending_videos = iter(plan.video_paths)
+        pending_videos = iter(video_paths)
         futures: dict[Future, Path] = {}
         try:
             self._fill_inflight(
