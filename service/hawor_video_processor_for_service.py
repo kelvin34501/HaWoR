@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Union
 
+from service.storage import PROCESS_DONE_FILENAME
+
 GpuIds = Union[str, Sequence[Union[int, str]]]
 
 
@@ -150,7 +152,7 @@ class HaWoRVideoProcessorForService:
                                               out_dir,
                                               overwrite_output=overwrite_output,
                                               exclude=exclude)
-                self._write_success_sentinel(out_dir, scratch_root)
+                self._write_done_sentinel(out_dir, scratch_root)
             finally:
                 self._publish_log(live_log_path, log_path)
 
@@ -311,17 +313,20 @@ class HaWoRVideoProcessorForService:
             except OSError:
                 pass
 
-    def _write_success_sentinel(self, out_dir: Path, scratch_root: Path) -> None:
-        """Write a process.success sentinel to *out_dir* (best-effort, s3mount-safe).
+    def _write_done_sentinel(self, out_dir: Path, scratch_root: Path) -> None:
+        """Write a process.done sentinel to *out_dir* (best-effort, s3mount-safe).
 
         Mirrors _publish_log: create a local file on scratch first, then copy
         sequentially to the (possibly s3mount) output directory.  Failures are
         silently swallowed so the sentinel never masks the actual processing result.
+
+        The file is written with non-empty content (``"x"``) because s3mount's
+        object-storage backend may not persist zero-byte objects.
         """
-        local_sentinel = scratch_root / "process.success"
-        remote_sentinel = out_dir / "process.success"
+        local_sentinel = scratch_root / PROCESS_DONE_FILENAME
+        remote_sentinel = out_dir / PROCESS_DONE_FILENAME
         try:
-            local_sentinel.write_text("")
+            local_sentinel.write_text("x")
             shutil.copyfile(local_sentinel, remote_sentinel)
         except OSError:
             pass

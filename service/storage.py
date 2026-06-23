@@ -18,7 +18,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 SUPPORTED_VIS_MODES = {"off", "cam", "world"}
 DEFAULT_S3MOUNT_PREFIXES = (Path("/mnt/oss"),)
 S3_URL_SCHEME = "s3://"
-PROCESS_SUCCESS_FILENAME = "process.success"
+PROCESS_DONE_FILENAME = "process.done"
 
 
 @dataclass(frozen=True)
@@ -174,8 +174,8 @@ def video_result_dir(output_dir: Path, video_path: Path) -> Path:
 
 
 def is_video_processed(output_dir: Path, video_path: Path) -> bool:
-    """Return True iff the video's result directory contains a success sentinel."""
-    return (video_result_dir(output_dir, video_path) / PROCESS_SUCCESS_FILENAME).exists()
+    """Return True iff the video's result directory contains a done sentinel."""
+    return (video_result_dir(output_dir, video_path) / PROCESS_DONE_FILENAME).exists()
 
 
 def _ensure_output_root_ready(output_dir: Path) -> None:

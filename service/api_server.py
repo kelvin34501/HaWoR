@@ -28,7 +28,7 @@ class AnnotateRequest(BaseModel):
     overwrite: bool = Field(default=False, description="Overwrite existing per-video outputs")
     skip_processed: bool = Field(
         default=False,
-        description="Skip videos whose output already contains a process.success sentinel",
+        description="Skip videos whose output already contains a process.done sentinel",
     )
 
 
