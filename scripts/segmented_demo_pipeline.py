@@ -109,6 +109,7 @@ def merge_last_two_chunks(chunks_dir: str, prev_chunk: str, last_chunk: str) -> 
             concat_list,
             "-c",
             "copy",
+            "-strict", "-2",
             tmp_merged,
         ]
 
@@ -132,6 +133,7 @@ def merge_last_two_chunks(chunks_dir: str, prev_chunk: str, last_chunk: str) -> 
                 "fast",
                 "-c:a",
                 "aac",
+                "-strict", "-2",
                 tmp_merged,
             ]
             run_cmd(cmd_reencode)
@@ -218,6 +220,7 @@ def split_video(
         str(segment_seconds),
         "-reset_timestamps",
         "1",
+        "-strict", "-2",
         out_pattern,
     ]
 

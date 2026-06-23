@@ -57,6 +57,7 @@ def extract_frames(video_path, output_folder, force=False):
 
     command = [
         "ffmpeg",
+        "-strict", "-2",
         "-i", video_path,
         "-vf", "fps=50",
         "-start_number", "0",
