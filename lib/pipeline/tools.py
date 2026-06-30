@@ -29,8 +29,11 @@ def detect_track(imgfiles, thresh=0.5):
     # Run
     boxes_ = []
     tracks = {}
-    for t, imgpath in enumerate(tqdm(imgfiles)):
-        img_cv2 = cv2.imread(imgpath)
+    for t in tqdm(range(len(imgfiles))):
+        item = imgfiles[t]
+        # `imgfiles` may be a FrameSource (returns a decoded BGR ndarray) or a
+        # legacy list of image paths.
+        img_cv2 = cv2.imread(item) if isinstance(item, str) else item
 
         ### --- Detection ---
         with torch.no_grad():

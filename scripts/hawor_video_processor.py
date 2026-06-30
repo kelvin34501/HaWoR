@@ -43,13 +43,13 @@ class HaWoRProcessorConfig:
     python_bin: str = sys.executable
     segment_seconds: int = 100
     min_last_segment_seconds: int = 60
-    split_mode: str = "reencode"
     overlap_policy: str = "keep_last"
     vis_mode: str = "off"
+    target_fps: float = 30
+    interp_target_fps: float = 50
     run_post_steps: bool = True
     force_interpolate: bool = False
     cleanup_intermediate: bool = True
-    overwrite_chunks: bool = False
 
 
 class GpuPool:
@@ -123,13 +123,11 @@ class HaWoRVideoProcessor:
             self._run_segmented_pipeline(video, work_dir, log_path, gpu_id, env)
             self._copy_merged_outputs(work_dir, out_dir, overwrite_output)
 
+            # Frames are never extracted to disk; the 50fps interpolation derives
+            # its frame count directly from the video.
             extracted_images_50fps_dir: Optional[Path] = None
-            if self.config.run_post_steps:
-                extracted_images_50fps_dir = out_dir / "extracted_images_50fps"
-                self._run_extract_50fps(video, extracted_images_50fps_dir, log_path, env)
-                self._run_interpolation(out_dir, log_path, env)
-            elif self.config.force_interpolate:
-                self._run_interpolation(out_dir, log_path, env)
+            if self.config.run_post_steps or self.config.force_interpolate:
+                self._run_interpolation(out_dir, video, log_path, env)
 
             if self.config.cleanup_intermediate and work_dir.exists():
                 shutil.rmtree(work_dir)
@@ -151,8 +149,6 @@ class HaWoRVideoProcessor:
             raise ValueError("segment_seconds must be positive")
         if self.config.min_last_segment_seconds < 0:
             raise ValueError("min_last_segment_seconds must be non-negative")
-        if self.config.split_mode not in {"copy", "reencode"}:
-            raise ValueError("split_mode must be 'copy' or 'reencode'")
         if self.config.overlap_policy not in {"keep_last", "keep_first"}:
             raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
         if shutil.which(self.config.python_bin) is None:
@@ -187,16 +183,14 @@ class HaWoRVideoProcessor:
             self.config.overlap_policy,
             "--vis_mode",
             self.config.vis_mode,
+            "--target_fps",
+            str(self.config.target_fps),
             "--gpu_id",
             str(gpu_id),
             "--work_dir",
             str(work_dir),
             "--skip_copy_back",
         ]
-        if self.config.split_mode == "reencode":
-            cmd.append("--reencode")
-        if self.config.overwrite_chunks:
-            cmd.append("--overwrite_chunks")
 
         self._run_command(cmd, log_path, env)
 
@@ -210,7 +204,7 @@ class HaWoRVideoProcessor:
         if not merged_dir.is_dir():
             raise FileNotFoundError(f"Merged output directory not found: {merged_dir}")
 
-        for name in ("cam_space", "SLAM", "extracted_images"):
+        for name in ("cam_space", "SLAM"):
             src = merged_dir / name
             if not src.exists():
                 continue
@@ -253,27 +247,10 @@ class HaWoRVideoProcessor:
             else:
                 path.unlink()
 
-    def _run_extract_50fps(
-        self,
-        video: Path,
-        output_folder: Path,
-        log_path: Path,
-        env: dict[str, str],
-    ) -> None:
-        script = self.config.project_dir / "scripts" / "extract_image_50fps.py"
-        cmd = [
-            self.config.python_bin,
-            str(script),
-            "--video_path",
-            str(video),
-            "--output_folder",
-            str(output_folder),
-        ]
-        self._run_command(cmd, log_path, env)
-
     def _run_interpolation(
         self,
         output_dir: Path,
+        video: Path,
         log_path: Path,
         env: dict[str, str],
     ) -> None:
@@ -283,6 +260,12 @@ class HaWoRVideoProcessor:
             str(script),
             "--folder_path",
             str(output_dir),
+            "--video_path",
+            str(video),
+            "--source_fps",
+            str(self.config.target_fps),
+            "--target_fps",
+            str(self.config.interp_target_fps),
         ]
         self._run_command(cmd, log_path, env)
 
@@ -358,7 +341,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python_bin", default=sys.executable)
     parser.add_argument("--segment_seconds", type=int, default=100)
     parser.add_argument("--min_last_segment_seconds", type=int, default=60)
-    parser.add_argument("--split_mode", choices=["copy", "reencode"], default="reencode")
+    parser.add_argument("--target_fps", type=float, default=30)
     parser.add_argument("--overlap_policy", choices=["keep_last", "keep_first"], default="keep_last")
     parser.add_argument("--vis_mode", default="off")
     parser.add_argument("--no_post_steps", action="store_true")
@@ -374,7 +357,7 @@ def main() -> None:
         python_bin=args.python_bin,
         segment_seconds=args.segment_seconds,
         min_last_segment_seconds=args.min_last_segment_seconds,
-        split_mode=args.split_mode,
+        target_fps=args.target_fps,
         overlap_policy=args.overlap_policy,
         vis_mode=args.vis_mode,
         run_post_steps=not args.no_post_steps,

@@ -1,4 +1,5 @@
 import os
+import shutil
 import cv2
 import numpy as np
 import torch
@@ -6,6 +7,37 @@ import trimesh
 
 import lib.vis.viewer as viewer_utils
 from lib.vis.wham_tools.tools import checkerboard_geometry
+
+
+def _dims_from_images(image_names):
+    """(height, width) from a FrameSource/subset (frame_shape) or a path list."""
+    if hasattr(image_names, "frame_shape"):
+        h, w = image_names.frame_shape
+        return int(h), int(w)
+    img0 = cv2.imread(image_names[0])
+    return img0.shape[0], img0.shape[1]
+
+
+def _materialize_frames(image_names, output_pth):
+    """Make on-disk paths for the billboard background.
+
+    The camera-space billboard needs image *files*. When given a FrameSource (RGB
+    frames decoded on demand), write just the vis-range frames to a temp dir and
+    return (paths, tmp_dir) so the caller can delete it afterwards. For a legacy
+    path list, return it unchanged with tmp_dir=None.
+    """
+    if not hasattr(image_names, "frame_shape"):
+        return list(image_names), None
+    tmp_dir = os.path.join(output_pth, "_vis_frames")
+    os.makedirs(tmp_dir, exist_ok=True)
+    paths = []
+    for i in range(len(image_names)):
+        frame_rgb = image_names[i]
+        p = os.path.join(tmp_dir, f"{i:06d}.jpg")
+        cv2.imwrite(p, frame_rgb[:, :, ::-1])  # back to BGR for cv2.imwrite
+        paths.append(p)
+    return paths, tmp_dir
+
 
 def camera_marker_geometry(radius, height):
     vertices = np.array(
@@ -50,9 +82,9 @@ def run_vis2_on_video(res_dict,
                       ghost_count=4,
                       ghost_alpha_decay=0.1,
                       ghost_alpha_min=0.05):
-    
-    img0 = cv2.imread(image_names[0])
-    height, width, _ = img0.shape
+
+    # World-space viz does not overlay the source frames; only dimensions are needed.
+    height, width = _dims_from_images(image_names)
 
     world_mano = {}
     world_mano['vertices'] = res_dict['vertices']
@@ -258,9 +290,8 @@ def run_vis2_on_video(res_dict,
         return os.path.join(output_pth, 'aitviewer', "video_0.mp4")
 
 def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_names, R_w2c=None, t_w2c=None):
-    
-    img0 = cv2.imread(image_names[0])
-    height, width, _ = img0.shape
+
+    height, width = _dims_from_images(image_names)
 
     world_mano = {}
     world_mano['vertices'] = res_dict['vertices']
@@ -322,11 +353,17 @@ def run_vis2_on_video_cam(res_dict, res_dict2, output_pth, focal_length, image_n
     vis_h = height
     vis_w = width
 
-    data = viewer_utils.ViewerData(Rt, K, cols, rows, imgnames=image_names)
+    # The billboard needs image files; decode the vis-range frames to a temp dir.
+    image_paths, tmp_dir = _materialize_frames(image_names, output_pth)
+    data = viewer_utils.ViewerData(Rt, K, cols, rows, imgnames=image_paths)
     batch = (meshes, data)
 
     viewer = viewer_utils.ARCTICViewer(interactive=True, size=(vis_w, vis_h))
-    viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
+    try:
+        viewer.render_seq(batch, out_folder=os.path.join(output_pth, 'aitviewer'))
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def lookat_matrix(source_pos, target_pos, up):
     """

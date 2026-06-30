@@ -10,6 +10,7 @@ Given a video and pre-computed cam_space annotations, this script:
 
 from __future__ import annotations
 
+import sys
 import os
 
 # ---------------------------------------------------------------------------
@@ -33,6 +34,10 @@ import numpy as np
 import torch
 from natsort import natsorted
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from lib.pipeline.frame_source import FrameSource
 
 
 def patch_pyopengl_osmesa() -> None:
@@ -63,6 +68,7 @@ def patch_pyopengl_osmesa() -> None:
     ensure_constant("OSMESA_CONTEXT_MINOR_VERSION", 0x37)
 
     if getattr(osmesa, "OSMesaCreateContextAttribs", None) is None:
+
         def OSMesaCreateContextAttribs(attrib_list, sharelist):
             pass
 
@@ -299,8 +305,12 @@ class PyrenderHandRenderer:
         # Camera — IntrinsicsCamera handles OpenCV-style intrinsics natively.
         # Input vertices must be in OpenGL convention: X→right, Y→up, Z→backward.
         self._camera = pyrender.IntrinsicsCamera(
-            fx=fx, fy=fy, cx=cx, cy=cy,
-            znear=0.001, zfar=100.0,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            znear=0.001,
+            zfar=100.0,
         )
         self._scene.add(self._camera, pose=np.eye(4), name="_camera")
 
@@ -394,9 +404,7 @@ class PyrenderHandRenderer:
 
         rendered_bgr = cv2.cvtColor(colour_rgb, cv2.COLOR_RGB2BGR)
         result = bg_img.copy()
-        result[mask] = (
-            bg_img[mask] * (1.0 - alpha) + rendered_bgr[mask] * alpha
-        ).astype(np.uint8)
+        result[mask] = (bg_img[mask] * (1.0 - alpha) + rendered_bgr[mask] * alpha).astype(np.uint8)
         return result
 
     def delete(self) -> None:
@@ -466,46 +474,6 @@ def _detect_focal(cam_space_dir: Path, default: float = 600.0) -> float:
     return default
 
 
-def _extract_frames(
-    video_path: Path,
-    cache_dir: Path,
-    fps: int,
-    *,
-    force: bool = False,
-) -> Path:
-    """Extract frames from video via ffmpeg, caching under cache_dir/extracted_images_<fps>fps/."""
-    img_dir = cache_dir / f"extracted_images_{fps}fps"
-
-    existing = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png"))
-    if existing and not force:
-        print(f"Using cached frames: {img_dir} ({len(existing)} files)", flush=True)
-        return img_dir
-
-    img_dir.mkdir(parents=True, exist_ok=True)
-
-    if force:
-        for f in existing:
-            f.unlink()
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(video_path),
-        "-vf",
-        f"fps={fps}",
-        "-start_number",
-        "0",
-        "-q:v",
-        "2",
-        str(img_dir / "%06d.jpg"),
-    ]
-    subprocess.run(cmd, check=True)
-    n_files = len(list(img_dir.glob("*.jpg")))
-    print(f"Extracted {n_files} frames @ {fps}fps to: {img_dir}", flush=True)
-    return img_dir
-
-
 def visualize_to_video(
     video_path: Path,
     cam_space_dir: Path,
@@ -513,22 +481,22 @@ def visualize_to_video(
     fps: int = 30,
     focal: Optional[float] = None,
     device: str = "cpu",
-    no_cache: bool = False,
-    overwrite_cache: bool = False,
     render_mode: str = "both",
     mesh_alpha: float = 0.5,
 ) -> None:
     """Render HaWoR 2D hand projections into an MP4 overlay video.
 
+    Frames are decoded on demand from the video via FrameSource -- nothing is
+    extracted or cached to disk.
+
     Args:
         video_path: Path to input video.
         cam_space_dir: Directory containing track_0/ and track_1/ MANO JSONs.
         output_path: Path for output MP4 file.
-        fps: Frame rate for extraction and output video.
+        fps: Frame rate for decoding and output video (must match how the
+            annotations were computed).
         focal: Camera focal length. Auto-detected from cam_space_dir if None.
         device: 'cpu' or 'cuda' for MANO forward pass.
-        no_cache: If True, extract frames to a temp directory (discarded after).
-        overwrite_cache: If True, re-extract frames even if cache exists.
         render_mode: 'skeleton', 'mesh', or 'both'.
         mesh_alpha: Opacity of hand mesh (0.0 - 1.0).
     """
@@ -544,20 +512,12 @@ def visualize_to_video(
     if focal is None:
         focal = _detect_focal(cam_space_dir)
 
-    if no_cache:
-        cache_dir = Path(tempfile.mkdtemp())
-        try:
-            img_dir = _extract_frames(video_path, cache_dir, fps, force=True)
-            _render_overlay(img_dir, cam_space_dir, output_path, fps, focal, device, render_mode, mesh_alpha)
-        finally:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-    else:
-        img_dir = _extract_frames(video_path, output_path.parent, fps, force=overwrite_cache)
-        _render_overlay(img_dir, cam_space_dir, output_path, fps, focal, device, render_mode, mesh_alpha)
+    frames = FrameSource(str(video_path), target_fps=fps, color="bgr")
+    _render_overlay(frames, cam_space_dir, output_path, fps, focal, device, render_mode, mesh_alpha)
 
 
 def _render_overlay(
-    img_dir: Path,
+    frames: FrameSource,
     cam_space_dir: Path,
     output_path: Path,
     fps: int,
@@ -566,19 +526,14 @@ def _render_overlay(
     render_mode: str = "both",
     mesh_alpha: float = 0.5,
 ) -> None:
-    """Internal: render hand overlay from extracted frames and cam_space data."""
-    img_files = natsorted(glob(str(img_dir / "*.jpg"))) or natsorted(glob(str(img_dir / "*.png")))
-    if not img_files:
-        raise FileNotFoundError(f"No images found in {img_dir}")
+    """Internal: render hand overlay from on-demand video frames and cam_space data."""
+    n_frames = len(frames)
+    if n_frames == 0:
+        raise RuntimeError("FrameSource produced no frames")
 
-    first_img = cv2.imread(img_files[0])
-    if first_img is None:
-        raise RuntimeError(f"Failed to read first image: {img_files[0]}")
-
-    h, w = first_img.shape[:2]
+    h, w = frames.frame_shape
     cx, cy = w / 2, h / 2
-    print(f"Processing {len(img_files)} frames at {w}x{h}, focal={focal:.1f}, fps={fps}, mode={render_mode}",
-          flush=True)
+    print(f"Processing {n_frames} frames at {w}x{h}, focal={focal:.1f}, fps={fps}, mode={render_mode}", flush=True)
 
     # ---- pyrender renderers (one per hand side) ---------------------------------
     renderer_left: Optional[PyrenderHandRenderer] = None
@@ -648,20 +603,21 @@ def _render_overlay(
     color_right = (0, 150, 0)
 
     try:
-        for frame_idx, img_file in enumerate(tqdm(img_files, desc="Encoding video")):
+        for frame_idx in tqdm(range(n_frames), desc="Encoding video"):
             if frame_idx % 100 == 0 and proc.poll() is not None:
                 raise RuntimeError(f"FFmpeg process died unexpectedly with return code {proc.returncode}")
 
-            img = cv2.imread(img_file)
-            if img is None:
-                continue
+            img = np.ascontiguousarray(frames[frame_idx])  # BGR, decoded on demand
 
             if frame_idx in left_joints:
                 if render_mode in ("mesh", "both"):
                     if renderer_left is not None:
                         img = renderer_left.render_hand(
-                            img, left_vertices[frame_idx], left_faces,
-                            color_left, mesh_alpha,
+                            img,
+                            left_vertices[frame_idx],
+                            left_faces,
+                            color_left,
+                            mesh_alpha,
                         )
                 if render_mode in ("skeleton", "both"):
                     draw_hand_skeleton(img, left_joints[frame_idx], color_left, thickness=4)
@@ -669,8 +625,11 @@ def _render_overlay(
                 if render_mode in ("mesh", "both"):
                     if renderer_right is not None:
                         img = renderer_right.render_hand(
-                            img, right_vertices[frame_idx], right_faces,
-                            color_right, mesh_alpha,
+                            img,
+                            right_vertices[frame_idx],
+                            right_faces,
+                            color_right,
+                            mesh_alpha,
                         )
                 if render_mode in ("skeleton", "both"):
                     draw_hand_skeleton(img, right_joints[frame_idx], color_right, thickness=4)
@@ -709,11 +668,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_path", required=True, help="Input video path")
     parser.add_argument("--cam_space_dir", required=True, help="Path to cam_space annotations (track_0/, track_1/)")
     parser.add_argument("--output", required=True, help="Output MP4 video path")
-    parser.add_argument("--fps", type=int, default=30, help="Frame rate for extraction and output")
+    parser.add_argument("--fps", type=int, default=30, help="Frame rate for decoding and output (match annotation fps)")
     parser.add_argument("--focal", type=float, default=None, help="Camera focal length (auto-detected if omitted)")
     parser.add_argument("--device", default="cpu", help="Device for MANO rendering, e.g. cpu or cuda")
-    parser.add_argument("--no_cache", action="store_true", help="Do not keep extracted frames on disk")
-    parser.add_argument("--overwrite_cache", action="store_true", help="Re-extract frames even if cache exists")
     parser.add_argument("--render_mode",
                         choices=["skeleton", "mesh", "both"],
                         default="both",
@@ -732,8 +689,6 @@ def main() -> None:
         fps=args.fps,
         focal=args.focal,
         device=args.device,
-        no_cache=args.no_cache,
-        overwrite_cache=args.overwrite_cache,
         render_mode=args.render_mode,
         mesh_alpha=args.mesh_alpha,
     )

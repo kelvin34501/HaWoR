@@ -64,8 +64,8 @@ run_task() {
         export CUDA_VISIBLE_DEVICES="$gpu_id"
 
         "$PYTHON_BIN" demo.py --video_path "$task" --vis_mode off
-        "$PYTHON_BIN" scripts/extract_image_50fps.py --video_path "$task" --output_folder "$folder_name/extracted_images_50fps"
-        "$PYTHON_BIN" scripts/interpolation.py --folder_path "$folder_name"
+        # Frames are decoded on demand; interpolation derives the 50fps count from the video.
+        "$PYTHON_BIN" scripts/interpolation.py --folder_path "$folder_name" --video_path "$task"
 
         echo "[$(timestamp)] DONE task=$task gpu=$gpu_id"
     } >>"$task_log" 2>&1

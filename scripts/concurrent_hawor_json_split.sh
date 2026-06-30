@@ -193,12 +193,10 @@ run_one_video() {
         local folder_name
         folder_name="${video_path%.[mM][Pp]4}"
 
-        if [[ "$RUN_POST_STEPS" == "1" ]]; then
-            "$PYTHON_BIN" "$PROJECT_DIR/scripts/extract_image_50fps.py" --video_path "$video_path" --output_folder "$folder_name/extracted_images_50fps"
-            "$PYTHON_BIN" "$PROJECT_DIR/scripts/interpolation.py" --folder_path "$folder_name"
-        elif [[ "$FORCE_INTERPOLATE" == "1" ]]; then
-            echo "[$(timestamp)] FORCE_INTERPOLATE=1: run interpolation without extract_image_50fps"
-            "$PYTHON_BIN" "$PROJECT_DIR/scripts/interpolation.py" --folder_path "$folder_name"
+        # Frames are decoded on demand; interpolation derives the 50fps count from
+        # the video, so extract_image_50fps.py is no longer needed.
+        if [[ "$RUN_POST_STEPS" == "1" || "$FORCE_INTERPOLATE" == "1" ]]; then
+            "$PYTHON_BIN" "$PROJECT_DIR/scripts/interpolation.py" --folder_path "$folder_name" --video_path "$video_path"
         fi
 
         if [[ "$CLEANUP_INTERMEDIATE" == "1" ]]; then

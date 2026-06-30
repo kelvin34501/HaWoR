@@ -39,7 +39,7 @@ Common startup options:
 - `--gpu-ids`: GPU pool definition such as `0` or `0,1`.
 - `--cleanup-intermediate` / `--no-cleanup-intermediate`: control whether successful job cache directories are deleted.
 - `--cleanup-failed-cache`: delete failed job cache directories instead of preserving them for debugging.
-- `--copy-extracted-images` / `--no-copy-extracted-images`: whether to copy `extracted_images` and `extracted_images_50fps` frame directories to the output directory. Disable to save storage when raw frames are not needed (default: enabled). Environment variable: `HAWOR_COPY_EXTRACTED_IMAGES`.
+- `--copy-extracted-images` / `--no-copy-extracted-images`: **deprecated no-op.** Frames are now decoded on demand from the video (`FrameSource`) and are never written to disk, so there are no `extracted_images`/`extracted_images_50fps` directories to copy. The flag (and `HAWOR_COPY_EXTRACTED_IMAGES`) is still accepted but has no effect.
 - `--s3mount-bin`: path to the `s3mount` binary (default `s3mount` on `PATH`).
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).
@@ -113,4 +113,4 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`, and
 - Native `s3://` and `petrel-oss` access are not implemented.
 - Empty directories, directories without supported video files, subpaths that escape the mount, and existing result directories with `overwrite=false` are rejected before dispatch.
 
-Each completed video is written to `output_dir/<video_stem>/`. The directory typically contains `cam_space/`, `SLAM/`, `extracted_images/`, `extracted_images_50fps/` when post-processing is enabled, and `process.log`.
+Each completed video is written to `output_dir/<video_stem>/`. The directory contains `cam_space/`, `SLAM/`, `process.log`, and — when post-processing is enabled — `cam_space_50fps/` plus the interpolated 50fps SLAM artifacts. Frames are decoded on demand and are **not** written to disk, so there are no `extracted_images*` directories.

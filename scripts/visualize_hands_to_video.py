@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.models.mano_wrapper import MANO
+from lib.pipeline.frame_source import FrameSource
 
 
 def drain_stderr_pipe(pipe, output_list):
@@ -468,15 +469,19 @@ def load_track_data(cam_space_dir, track_id, is_left, focal, cx, cy, device="cpu
     return frame_data
 
 
-def visualize_to_video(task_dir, output_path, fps=30, device="cpu", 
-                       captions_json=None, segment_def_json=None, 
+def visualize_to_video(video_path, task_dir, output_path, fps=30, device="cpu",
+                       captions_json=None, segment_def_json=None,
                        caption_font_scale=0.7, caption_padding=10,
                        captions_fps=50, start_frame=None, end_frame=None):
     """
     Visualize hand keypoints and encode to video via ffmpeg pipe.
-    
+
+    Frames are decoded on demand from the video via FrameSource -- nothing is
+    extracted or cached to disk.
+
     Args:
-        task_dir: Path to task directory (e.g., example/clip_1/00_task)
+        video_path: Path to the source video (frames decoded on demand).
+        task_dir: Path to task directory (cam_space/, est_focal.txt)
         output_path: Output video path (e.g., output.mp4)
         fps: Video frame rate (default 30, matching detect_track_video.py extraction)
         device: torch device for MANO
@@ -507,32 +512,24 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
         if clips:
             print(f"Loaded {len(clips)} caption clips for {task_name}")
 
-    # Load images
-    img_dir = task_path / 'extracted_images'
-    all_img_files = natsorted(glob(str(img_dir / '*.jpg'))) or natsorted(glob(str(img_dir / '*.png')))
-    
-    if not all_img_files:
-        raise FileNotFoundError(f"No images found in {img_dir}")
-    
-    # Filter by frame range if specified
+    # Frames decoded on demand from the video (no extracted_images on disk).
     if start_frame is not None or end_frame is not None:
         start_idx = start_frame if start_frame is not None else 0
-        end_idx = end_frame if end_frame is not None else len(all_img_files)
-        img_files = all_img_files[start_idx:end_idx]
+        frames = FrameSource(str(video_path), target_fps=fps, start=start_idx, end=end_frame, color='bgr')
         frame_offset = start_idx
     else:
-        img_files = all_img_files
+        frames = FrameSource(str(video_path), target_fps=fps, color='bgr')
         frame_offset = 0
-    
-    if not img_files:
-        raise ValueError(f"No images in specified range [{start_frame}, {end_frame})")
+
+    n_frames = len(frames)
+    if n_frames == 0:
+        raise ValueError(f"No frames in specified range [{start_frame}, {end_frame})")
 
     # Get image dimensions
-    first_img = cv2.imread(img_files[0])
-    h, w = first_img.shape[:2]
+    h, w = frames.frame_shape
     cx, cy = w / 2, h / 2
 
-    print(f"Processing {len(img_files)} frames at {w}x{h}, focal={focal:.1f}, fps={fps}")
+    print(f"Processing {n_frames} frames at {w}x{h}, focal={focal:.1f}, fps={fps}")
 
     # Load cam_space data for both hands
     # Track 0 = left hand, Track 1 = right hand (hardcoded)
@@ -590,15 +587,13 @@ def visualize_to_video(task_dir, output_path, fps=30, device="cpu",
         fade_frames = 10  # Number of frames for fade transition
         
         # Process frames with progress bar
-        for local_idx in tqdm(range(len(img_files)), desc="Encoding video"):
+        for local_idx in tqdm(range(n_frames), desc="Encoding video"):
             # Check if FFmpeg process is still alive every 100 frames
             if local_idx % 100 == 0 and proc.poll() is not None:
                 raise RuntimeError(f"FFmpeg process died unexpectedly with return code {proc.returncode}")
-            
-            img = cv2.imread(img_files[local_idx])
-            if img is None:
-                continue
-            
+
+            img = np.ascontiguousarray(frames[local_idx])  # BGR, decoded on demand
+
             # Calculate actual frame index in original sequence
             frame_idx = local_idx + frame_offset
 
@@ -673,8 +668,10 @@ Example usage:
 Note: Default FPS is 30 to match the frame extraction rate in detect_track_video.py
       Track 0 = left hand (darker red), Track 1 = right hand (darker green)
         """)
-    parser.add_argument('--dir', required=True, 
-                       help='Task directory containing cam_space/ and extracted_images/')
+    parser.add_argument('--dir', required=True,
+                       help='Task directory containing cam_space/ and est_focal.txt')
+    parser.add_argument('--video_path', required=True,
+                       help='Source video (frames are decoded on demand, not from extracted_images/)')
     parser.add_argument('--output', required=True,
                        help='Output video path (e.g., output.mp4)')
     parser.add_argument('--fps', type=int, default=30,
@@ -703,14 +700,13 @@ Note: Default FPS is 30 to match the frame extraction rate in detect_track_video
         sys.exit(1)
 
     cam_space = task_path / 'cam_space'
-    img_dir = task_path / 'extracted_images'
-    
+
     if not cam_space.exists():
         print(f"Error: cam_space/ not found in {task_path}")
         sys.exit(1)
-    
-    if not img_dir.exists():
-        print(f"Error: extracted_images/ not found in {task_path}")
+
+    if not Path(args.video_path).is_file():
+        print(f"Error: video not found: {args.video_path}")
         sys.exit(1)
 
     # Create output directory if needed
@@ -719,7 +715,7 @@ Note: Default FPS is 30 to match the frame extraction rate in detect_track_video
 
     # Always render the main full video first
     print("Rendering main full video...")
-    visualize_to_video(args.dir, args.output, fps=args.fps, device=args.device,
+    visualize_to_video(args.video_path, args.dir, args.output, fps=args.fps, device=args.device,
                       captions_json=args.captions_json,
                       segment_def_json=args.segment_def_json,
                       caption_font_scale=args.caption_font_scale,
@@ -775,7 +771,7 @@ Note: Default FPS is 30 to match the frame extraction rate in detect_track_video
                     # Render this clip
                     try:
                         visualize_to_video(
-                            args.dir, clip_output_path, 
+                            args.video_path, args.dir, clip_output_path,
                             fps=args.fps, device=args.device,
                             captions_json=args.captions_json,
                             segment_def_json=args.segment_def_json,

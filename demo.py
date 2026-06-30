@@ -10,6 +10,7 @@ import joblib
 from scripts.scripts_test_video.detect_track_video import detect_track_video
 from scripts.scripts_test_video.hawor_video import hawor_motion_estimation, hawor_infiller
 from scripts.scripts_test_video.hawor_slam import hawor_slam
+from lib.pipeline.frame_source import frame_source_from_args
 from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
 from lib.eval_utils.custom_utils import load_slam_cam
 from lib.vis.run_vis2 import run_vis2_on_video, run_vis2_on_video_cam
@@ -23,10 +24,14 @@ if __name__ == '__main__':
     parser.add_argument("--checkpoint",  type=str, default='./weights/hawor/checkpoints/hawor.ckpt')
     parser.add_argument("--infiller_weight",  type=str, default='./weights/hawor/checkpoints/infiller.pt')
     parser.add_argument("--vis_mode",  type=str, default='world', help='cam | world')
+    parser.add_argument("--target_fps", type=float, default=30, help='decode/resample fps (matches old ffmpeg fps=N)')
+    parser.add_argument("--frame_start", type=int, default=0, help='first frame (in target_fps timeline) of the window to process')
+    parser.add_argument("--frame_end", type=int, default=None, help='end frame (exclusive) of the window to process; None = to end')
+    parser.add_argument("--seq_dir", type=str, default=None, help='output seq folder override (segmented pipeline uses a distinct dir per window)')
     args = parser.parse_args()
 
     start = time.perf_counter()
-    start_idx, end_idx, seq_folder, imgfiles = detect_track_video(args)
+    start_idx, end_idx, seq_folder, frame_source = detect_track_video(args)
     elapsed = time.perf_counter() - start
     print(f"Detection and tracking time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
 
@@ -108,20 +113,21 @@ if __name__ == '__main__':
     # Here we use aitviewer(https://github.com/eth-ait/aitviewer) for simple visualization.
     if args.vis_mode == 'off':
         print("Skipping visualization (vis_mode=off)")
-    elif args.vis_mode == 'world': 
+    elif args.vis_mode == 'world':
         output_pth = os.path.join(seq_folder, f"vis_{vis_start}_{vis_end}")
         if not os.path.exists(output_pth):
             os.makedirs(output_pth)
-        image_names = imgfiles[vis_start:vis_end]
+        # Decode background frames on demand (RGB) for the vis range.
+        image_source = frame_source_from_args(args, color='rgb')[vis_start:vis_end]
         print(f"vis {vis_start} to {vis_end}")
-        run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_names, R_c2w=R_c2w_sla_all[vis_start:vis_end], t_c2w=t_c2w_sla_all[vis_start:vis_end])
+        run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_source, R_c2w=R_c2w_sla_all[vis_start:vis_end], t_c2w=t_c2w_sla_all[vis_start:vis_end])
     elif args.vis_mode == 'cam':
         output_pth = os.path.join(seq_folder, f"vis_{vis_start}_{vis_end}")
         if not os.path.exists(output_pth):
             os.makedirs(output_pth)
-        image_names = imgfiles[vis_start:vis_end]
+        image_source = frame_source_from_args(args, color='rgb')[vis_start:vis_end]
         print(f"vis {vis_start} to {vis_end}")
-        run_vis2_on_video_cam(left_dict, right_dict, output_pth, img_focal, image_names, R_w2c=R_w2c_sla_all[vis_start:vis_end], t_w2c=t_w2c_sla_all[vis_start:vis_end])
+        run_vis2_on_video_cam(left_dict, right_dict, output_pth, img_focal, image_source, R_w2c=R_w2c_sla_all[vis_start:vis_end], t_w2c=t_w2c_sla_all[vis_start:vis_end])
 
     print("finish")
 

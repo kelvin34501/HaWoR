@@ -11,6 +11,7 @@ from glob import glob
 from natsort import natsorted
 
 from lib.pipeline.tools import parse_chunks, parse_chunks_hand_frame
+from lib.pipeline.frame_source import frame_source_from_args
 from lib.models.hawor import HAWOR
 from lib.eval_utils.custom_utils import cam2world_convert, load_slam_cam
 from lib.eval_utils.custom_utils import interpolate_bboxes
@@ -45,10 +46,9 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
     model.eval()
 
     file = args.video_path
-    video_root = os.path.dirname(file)
     video = os.path.basename(file).split('.')[0]
-    img_folder = f"{video_root}/{video}/extracted_images"
-    imgfiles = np.array(natsorted(glob(f'{img_folder}/*.jpg')))
+    # Frames are decoded on demand from the video (RGB, as the model expects).
+    frame_source = frame_source_from_args(args, color='rgb')
 
     tracks = np.load(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_tracks.npy', allow_pickle=True).item()
     img_focal = args.img_focal
@@ -92,14 +92,13 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
     }
     tid = [0, 1]
 
-    img = cv2.imread(imgfiles[0])
-    img_center = [img.shape[1] / 2, img.shape[0] / 2]# w/2, h/2  
-    H, W = img.shape[:2]
-    model_masks = np.zeros((len(imgfiles), H, W))
+    H, W = frame_source.frame_shape
+    img_center = [W / 2, H / 2]# w/2, h/2
+    model_masks = np.zeros((len(frame_source), H, W))
 
     bin_size = 128
     max_faces_per_bin = 20000
-    renderer = Renderer(img.shape[1], img.shape[0], img_focal, 'cuda', 
+    renderer = Renderer(W, H, img_focal, 'cuda',
                     bin_size=bin_size, max_faces_per_bin=max_faces_per_bin)
     # get faces
     faces = get_mano_faces()
@@ -154,7 +153,7 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
 
         for frame_ck, boxes_ck in zip(frame_chunks, boxes_chunks):
             print(f"inference from frame {frame_ck[0]} to {frame_ck[-1]}")
-            img_ck = imgfiles[frame_ck]
+            img_ck = frame_source[frame_ck]
             if is_right[0] > 0:
                 do_flip = False
             else:
@@ -200,7 +199,7 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
                 outputs = run_mano(data_out["init_trans"], data_out["init_root_orient"], data_out["init_hand_pose"], betas=data_out["init_betas"])
             
             vertices = outputs["vertices"][0].cpu()  # (T, N, 3)
-            for img_i, _ in enumerate(img_ck):
+            for img_i in range(len(img_ck)):
                 if do_flip:
                     faces = torch.from_numpy(faces_left).cuda()
                 else:
@@ -239,11 +238,10 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
     file = args.video_path
     video_root = os.path.dirname(file)
     video = os.path.basename(file).split('.')[0]
-    seq_folder = os.path.join(video_root, video)
-    img_folder = f"{video_root}/{video}/extracted_images"
+    seq_folder = args.seq_dir if getattr(args, 'seq_dir', None) else os.path.join(video_root, video)
 
-    # Previous steps
-    imgfiles = np.array(natsorted(glob(f'{img_folder}/*.jpg')))
+    # The infiller needs no pixels, only the frame count for tensor allocation.
+    num_frames = len(frame_source_from_args(args))
 
     idx2hand = ['left', 'right']
     filling_length = 120
@@ -251,10 +249,10 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
     fpath = os.path.join(seq_folder, f"SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     R_w2c_sla_all, t_w2c_sla_all, R_c2w_sla_all, t_c2w_sla_all = load_slam_cam(fpath)
 
-    pred_trans = torch.zeros(2, len(imgfiles), 3)
-    pred_rot = torch.zeros(2, len(imgfiles), 3)
-    pred_hand_pose = torch.zeros(2, len(imgfiles), 45)
-    pred_betas = torch.zeros(2, len(imgfiles), 10)
+    pred_trans = torch.zeros(2, num_frames, 3)
+    pred_rot = torch.zeros(2, num_frames, 3)
+    pred_hand_pose = torch.zeros(2, num_frames, 45)
+    pred_betas = torch.zeros(2, num_frames, 10)
     pred_valid = torch.zeros((2, pred_betas.size(1)))    
 
     # camera space to world space
@@ -300,11 +298,11 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
             start_shift = -1
             while frame_ck[0] + start_shift >= 0 and pred_valid[:, frame_ck[0] + start_shift].sum() != 2:
                 start_shift -= 1  # Shift to find the previous valid frame as start
-            print(f"run infiller on frame {frame_ck[0] + start_shift} to frame {min(len(imgfiles)-1, frame_ck[0] + start_shift + filling_length)}")
+            print(f"run infiller on frame {frame_ck[0] + start_shift} to frame {min(num_frames-1, frame_ck[0] + start_shift + filling_length)}")
 
             frame_start = frame_ck[0]
             filling_net_start = max(0, frame_start + start_shift)
-            filling_net_end = min(len(imgfiles)-1, filling_net_start + filling_length)
+            filling_net_end = min(num_frames-1, filling_net_start + filling_length)
             seq_valid = pred_valid[:, filling_net_start:filling_net_end]
             filling_seq = {}
             filling_seq['trans'] = pred_trans[:, filling_net_start:filling_net_end].numpy()

@@ -23,6 +23,8 @@ from evo.core.metrics import PoseRelation
 from pycocotools import mask as masktool
 from torchvision.transforms import Resize
 
+from lib.pipeline.frame_source import FrameSource
+
 # Some default settings for DROID-SLAM
 parser = argparse.ArgumentParser()
 parser.add_argument("--imagedir", type=str, help="path to image directory")
@@ -56,15 +58,22 @@ args.disable_vis = True
 torch.multiprocessing.set_start_method('spawn')
 
 
-def est_calib(imagedir):
-    """ Roughly estimate intrinsics by image dimensions """
+def _src_dims(imagedir):
+    """ (h0, w0) of the first frame, for a FrameSource / path list / directory """
+    if isinstance(imagedir, FrameSource):
+        h0, w0 = imagedir.frame_shape
+        return h0, w0
     if isinstance(imagedir, list):
         imgfiles = imagedir
     else:
         imgfiles = sorted(glob(f'{imagedir}/*.jpg'))
-    image = cv2.imread(imgfiles[0])
+    h0, w0, _ = cv2.imread(imgfiles[0]).shape
+    return h0, w0
 
-    h0, w0, _ = image.shape
+
+def est_calib(imagedir):
+    """ Roughly estimate intrinsics by image dimensions """
+    h0, w0 = _src_dims(imagedir)
     focal = np.max([h0, w0])
     cx, cy = w0/2., h0/2.
     calib = [focal, focal, cx, cy]
@@ -73,19 +82,14 @@ def est_calib(imagedir):
 
 def get_dimention(imagedir):
     """ Get proper image dimension for DROID """
-    if isinstance(imagedir, list):
-        imgfiles = imagedir
-    else:
-        imgfiles = sorted(glob(f'{imagedir}/*.jpg'))
-    image = cv2.imread(imgfiles[0])
-
-    h0, w0, _ = image.shape
+    h0, w0 = _src_dims(imagedir)
     h1 = int(h0 * np.sqrt((384 * 512) / (h0 * w0)))
     w1 = int(w0 * np.sqrt((384 * 512) / (h0 * w0)))
 
-    image = cv2.resize(image, (w1, h1))
-    image = image[:h1-h1%8, :w1-w1%8]
-    H, W, _ = image.shape
+    # Resize to (w1, h1) then crop to an 8-aligned size (same as the old code,
+    # computed arithmetically so no frame needs to be decoded here).
+    H = h1 - h1 % 8
+    W = w1 - w1 % 8
     return H, W
 
 
@@ -99,16 +103,26 @@ def image_stream(imagedir, calib, stride, max_frame=None):
     K[1,1] = fy
     K[1,2] = cy
 
-    if isinstance(imagedir, list):
-        image_list = imagedir
+    if isinstance(imagedir, FrameSource):
+        # Decode frames on demand (BGR, matching cv2.imread).
+        indices = list(range(0, len(imagedir), stride))
+        if max_frame is not None:
+            indices = indices[:max_frame]
+        read = lambda ref: imagedir[ref]
+        refs = indices
     else:
-        image_list = sorted(glob(f'{imagedir}/*.jpg'))
-    image_list = image_list[::stride]
-    if max_frame is not None:
-        image_list = image_list[:max_frame]
+        if isinstance(imagedir, list):
+            image_list = imagedir
+        else:
+            image_list = sorted(glob(f'{imagedir}/*.jpg'))
+        image_list = image_list[::stride]
+        if max_frame is not None:
+            image_list = image_list[:max_frame]
+        read = lambda ref: cv2.imread(ref)
+        refs = image_list
 
-    for t, imfile in enumerate(image_list):
-        image = cv2.imread(imfile)
+    for t, ref in enumerate(refs):
+        image = read(ref)
         if len(calib) > 4:
             image = cv2.undistort(image, K, calib[4:])
 

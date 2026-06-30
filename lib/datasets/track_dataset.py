@@ -48,7 +48,12 @@ class TrackDatasetEval(Dataset):
         img_focal = self.img_focal
         img_center = self.img_center
 
-        img = cv2.imread(imgfile)[:,:,::-1]
+        # `imgfile` is either a path (legacy) or an already-decoded RGB ndarray
+        # (when `imgfiles` is a FrameSource subset).
+        if isinstance(imgfile, str):
+            img = cv2.imread(imgfile)[:,:,::-1]
+        else:
+            img = imgfile
         if self.do_flip:
             img = img[:, ::-1, :]
             img_width = img.shape[1]

@@ -41,13 +41,15 @@ class HaWoRProcessorConfig:
     project_dir: Path = Path(__file__).resolve().parents[1]
     segment_seconds: int = 100
     min_last_segment_seconds: int = 60
-    split_mode: str = "reencode"
     overlap_policy: str = "keep_last"
     vis_mode: str = "off"
+    target_fps: float = 30
+    interp_target_fps: float = 50
     run_post_steps: bool = True
     force_interpolate: bool = False
     cleanup_intermediate: bool = True
-    overwrite_chunks: bool = False
+    # Frames are decoded on demand from the video; nothing is extracted to disk, so
+    # this flag is accepted for API compatibility but has no effect.
     copy_extracted_images: bool = True
 
 
@@ -136,22 +138,16 @@ class HaWoRVideoProcessorForService:
                 self._run_segmented_pipeline(video, work_dir, live_log_path, gpu_id, env)
                 self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
 
+                # Frames are never extracted to disk; the 50fps interpolation derives
+                # its frame count directly from the video.
                 extracted_images_50fps_dir: Optional[Path] = None
-                if self.config.run_post_steps:
-                    extracted_images_50fps_dir = staged_output_dir / "extracted_images_50fps"
-                    self._run_extract_50fps(video, extracted_images_50fps_dir, live_log_path, env)
-                    self._run_interpolation(staged_output_dir, live_log_path, env)
-                elif self.config.force_interpolate:
-                    self._run_interpolation(staged_output_dir, live_log_path, env)
+                if self.config.run_post_steps or self.config.force_interpolate:
+                    self._run_interpolation(staged_output_dir, video, live_log_path, env)
 
-                exclude: frozenset[str] = frozenset()
-                if not self.config.copy_extracted_images:
-                    exclude = frozenset({"extracted_images", "extracted_images_50fps"})
                 out_dir.mkdir(parents=True, exist_ok=True)
                 self._copy_directory_contents(staged_output_dir,
                                               out_dir,
-                                              overwrite_output=overwrite_output,
-                                              exclude=exclude)
+                                              overwrite_output=overwrite_output)
                 self._write_done_sentinel(out_dir, scratch_root)
             finally:
                 self._publish_log(live_log_path, log_path)
@@ -177,8 +173,6 @@ class HaWoRVideoProcessorForService:
             raise ValueError("segment_seconds must be positive")
         if self.config.min_last_segment_seconds < 0:
             raise ValueError("min_last_segment_seconds must be non-negative")
-        if self.config.split_mode not in {"copy", "reencode"}:
-            raise ValueError("split_mode must be 'copy' or 'reencode'")
         if self.config.overlap_policy not in {"keep_last", "keep_first"}:
             raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
         if shutil.which(sys.executable) is None:
@@ -213,15 +207,13 @@ class HaWoRVideoProcessorForService:
             self.config.overlap_policy,
             "--vis_mode",
             self.config.vis_mode,
+            "--target_fps",
+            str(self.config.target_fps),
             "--gpu_id",
             str(gpu_id),
             "--work_dir",
             str(work_dir),
         ]
-        if self.config.split_mode == "reencode":
-            cmd.append("--reencode")
-        if self.config.overwrite_chunks:
-            cmd.append("--overwrite_chunks")
         cmd.append("--skip_copy_back")
 
         self._run_command(cmd, log_path, env)
@@ -331,27 +323,10 @@ class HaWoRVideoProcessorForService:
         except OSError:
             pass
 
-    def _run_extract_50fps(
-        self,
-        video: Path,
-        output_folder: Path,
-        log_path: Path,
-        env: dict[str, str],
-    ) -> None:
-        script = self.config.project_dir / "scripts" / "extract_image_50fps.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "--video_path",
-            str(video),
-            "--output_folder",
-            str(output_folder),
-        ]
-        self._run_command(cmd, log_path, env)
-
     def _run_interpolation(
         self,
         output_dir: Path,
+        video: Path,
         log_path: Path,
         env: dict[str, str],
     ) -> None:
@@ -361,6 +336,12 @@ class HaWoRVideoProcessorForService:
             str(script),
             "--folder_path",
             str(output_dir),
+            "--video_path",
+            str(video),
+            "--source_fps",
+            str(self.config.target_fps),
+            "--target_fps",
+            str(self.config.interp_target_fps),
         ]
         self._run_command(cmd, log_path, env)
 

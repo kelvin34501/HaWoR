@@ -1,5 +1,6 @@
 numpy==1.26.4
 opencv-python
+decord  # on-demand video frame decoding (FrameSource); avoids extracting JPEGs to disk
 pyrender
 scikit-image
 smplx==0.1.28

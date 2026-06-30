@@ -137,7 +137,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--copy-extracted-images",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Copy extracted_images / extracted_images_50fps frames to the output directory (default: true)",
+        help="Deprecated no-op: frames are decoded on demand and never written to disk, "
+             "so there are no extracted_images to copy. Accepted for backward compatibility.",
     )
     return parser
 

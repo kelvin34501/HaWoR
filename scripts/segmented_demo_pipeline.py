@@ -2,13 +2,15 @@
 """Segment -> demo.py -> merge cam_space chunk results.
 
 This script is designed for long videos that are expensive to process in one pass.
-It splits input video(s) into chunks, runs demo.py on each chunk, and merges per-frame
+It runs demo.py over consecutive frame-index windows of the input video (decoded on
+demand via FrameSource — no chunk files, no JPEG dump) and merges per-frame
 camera-space parameters back into a single timeline.
 
 Notes
 - It merges camera-space params only (init_root_orient/init_hand_pose/init_trans/init_betas).
 - No world-space alignment is performed.
-- Frame timeline is recovered by cumulative extracted frame count per chunk.
+- Each window is processed in its own seq dir (work_dir/chunk_NNNNNN); the global
+  frame offset is the window start index.
 """
 
 import argparse
@@ -24,10 +26,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from lib.pipeline.frame_source import FrameSource
+
 
 RANGE_RE = re.compile(r"(\d+)_(\d+)(?:_50fps)?\.json$")
 RANGE_NAME_RE = re.compile(r"^(\d+)_(\d+)((?:_50fps)?\.json)$")
-IMG_NAME_RE = re.compile(r"^(\d+)(\.[^.]+)$")
 FIELDS = ["init_root_orient", "init_hand_pose", "init_trans", "init_betas"]
 SLAM_MAIN_RE = re.compile(r"^hawor_slam_w_scale_(\d+)_(\d+)\.npz$")
 
@@ -62,183 +66,42 @@ def seq_name_for_video(video_path: str) -> str:
     return os.path.basename(video_path).split(".")[0]
 
 
-def ensure_ffmpeg_exists() -> None:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg not found in PATH")
-    if shutil.which("ffprobe") is None:
-        raise RuntimeError("ffprobe not found in PATH")
+def count_frames(video_path: str, target_fps: float) -> int:
+    """Number of frames in the (resampled) timeline demo.py will see."""
+    return len(FrameSource(video_path, target_fps=target_fps))
 
 
-def probe_video_duration(video_path: str) -> float:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        video_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffprobe failed for {video_path}: {proc.stderr.strip()}")
-    try:
-        return max(0.0, float(proc.stdout.strip()))
-    except ValueError as e:
-        raise RuntimeError(f"Invalid ffprobe duration output for {video_path}: {proc.stdout!r}") from e
+def compute_windows(
+    n_frames: int,
+    chunk_frames: int,
+    min_last_frames: int,
+) -> List[Tuple[int, int]]:
+    """Split [0, n_frames) into consecutive [start, end) windows.
 
+    A trailing window shorter than ``min_last_frames`` is merged into the previous
+    window (mirrors the old min-last-chunk-duration behaviour, in frame units).
+    """
+    if n_frames <= 0:
+        return []
+    if chunk_frames <= 0:
+        return [(0, n_frames)]
 
-def merge_last_two_chunks(chunks_dir: str, prev_chunk: str, last_chunk: str) -> None:
-    concat_list = os.path.join(chunks_dir, "_concat_last_two.txt")
-    tmp_merged = prev_chunk + ".tmpmerge.mp4"
-
-    try:
-        with open(concat_list, "w") as f:
-            f.write(f"file '{os.path.abspath(prev_chunk)}'\n")
-            f.write(f"file '{os.path.abspath(last_chunk)}'\n")
-
-        cmd_copy = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_list,
-            "-c",
-            "copy",
-            "-strict", "-2",
-            tmp_merged,
-        ]
-
-        try:
-            run_cmd(cmd_copy)
-        except RuntimeError:
-            cmd_reencode = [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                concat_list,
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-preset",
-                "fast",
-                "-c:a",
-                "aac",
-                "-strict", "-2",
-                tmp_merged,
-            ]
-            run_cmd(cmd_reencode)
-
-        os.replace(tmp_merged, prev_chunk)
-        os.remove(last_chunk)
-    finally:
-        if os.path.isfile(concat_list):
-            os.remove(concat_list)
-        if os.path.isfile(tmp_merged):
-            os.remove(tmp_merged)
-
-
-def enforce_min_last_chunk_duration(
-    chunks_dir: str,
-    chunks: List[str],
-    min_last_segment_seconds: int,
-) -> List[str]:
-    if min_last_segment_seconds <= 0 or len(chunks) < 2:
-        return chunks
-
-    last_chunk = chunks[-1]
-    last_duration = probe_video_duration(last_chunk)
-
-    if last_duration >= float(min_last_segment_seconds):
-        return chunks
-
-    prev_chunk = chunks[-2]
-    log(
-        "[split] last chunk too short "
-        f"({last_duration:.3f}s < {min_last_segment_seconds}s), merge into previous chunk"
-    )
-    merge_last_two_chunks(chunks_dir, prev_chunk, last_chunk)
-    normalized = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
-    if not normalized:
-        raise RuntimeError(f"No chunks left after last-chunk normalization in {chunks_dir}")
-    return normalized
-
-
-def split_video(
-    video_path: str,
-    chunks_dir: str,
-    segment_seconds: int,
-    min_last_segment_seconds: int,
-    reencode: bool,
-    overwrite: bool,
-) -> List[str]:
-    os.makedirs(chunks_dir, exist_ok=True)
-
-    if overwrite:
-        for p in glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")):
-            os.remove(p)
-
-    existing = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
-    if existing:
-        log(f"[split] Reuse existing chunks: {len(existing)}")
-        return enforce_min_last_chunk_duration(
-            chunks_dir=chunks_dir,
-            chunks=existing,
-            min_last_segment_seconds=min_last_segment_seconds,
-        )
-
-    out_pattern = os.path.join(chunks_dir, "chunk_%06d.mp4")
-    cmd = ["ffmpeg", "-y", "-i", video_path]
-
-    if reencode:
-        cmd += [
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "fast",
-            "-c:a",
-            "aac",
-        ]
-    else:
-        cmd += ["-c", "copy"]
-
-    cmd += [
-        "-f",
-        "segment",
-        "-segment_time",
-        str(segment_seconds),
-        "-reset_timestamps",
-        "1",
-        "-strict", "-2",
-        out_pattern,
-    ]
-
-    log(f"[split] {' '.join(cmd)}")
-    run_cmd(cmd)
-
-    chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
-    if not chunks:
-        raise RuntimeError(f"No chunks generated for {video_path}")
-    return enforce_min_last_chunk_duration(
-        chunks_dir=chunks_dir,
-        chunks=chunks,
-        min_last_segment_seconds=min_last_segment_seconds,
-    )
+    windows = [(s, min(s + chunk_frames, n_frames)) for s in range(0, n_frames, chunk_frames)]
+    if len(windows) >= 2 and min_last_frames > 0:
+        ls, le = windows[-1]
+        if (le - ls) < min_last_frames:
+            ps, _ = windows[-2]
+            windows[-2] = (ps, le)
+            windows.pop()
+    return windows
 
 
 def run_demo_on_chunk(
-    chunk_path: str,
+    video_abs: str,
+    seq_dir: str,
+    frame_start: int,
+    frame_end: int,
+    target_fps: float,
     project_dir: str,
     python_bin: str,
     vis_mode: str,
@@ -248,25 +111,22 @@ def run_demo_on_chunk(
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    cmd = [python_bin, "demo.py", "--video_path", chunk_path, "--vis_mode", vis_mode]
+    os.makedirs(seq_dir, exist_ok=True)
+    cmd = [
+        python_bin, "demo.py",
+        "--video_path", video_abs,
+        "--vis_mode", vis_mode,
+        "--target_fps", str(target_fps),
+        "--frame_start", str(frame_start),
+        "--frame_end", str(frame_end),
+        "--seq_dir", seq_dir,
+    ]
     log(f"[demo] {' '.join(cmd)}")
     run_cmd(cmd, cwd=project_dir, env=env)
 
-    seq_dir = os.path.join(os.path.dirname(chunk_path), seq_name_for_video(chunk_path))
     if not os.path.isdir(seq_dir):
         raise RuntimeError(f"Chunk output seq dir missing: {seq_dir}")
     return seq_dir
-
-
-def count_extracted_frames(seq_dir: str) -> int:
-    img_dir = os.path.join(seq_dir, "extracted_images")
-    if not os.path.isdir(img_dir):
-        return 0
-    patterns = ["*.jpg", "*.png", "*.jpeg"]
-    count = 0
-    for pat in patterns:
-        count += len(glob.glob(os.path.join(img_dir, pat)))
-    return count
 
 
 def chunk_local_span(cam_space_dir: str) -> int:
@@ -349,57 +209,6 @@ def merge_cam_space(
     if copied_count == 0:
         raise RuntimeError("No cam_space chunks found to merge")
     log(f"[merge] Copied {copied_count} cam_space json files into {out_dir}")
-
-
-def _renumber_image_name(image_path: str, global_idx: int, local_idx: int) -> str:
-    name = os.path.basename(image_path)
-    m = IMG_NAME_RE.match(name)
-    if m:
-        width = max(6, len(m.group(1)))
-        return f"{global_idx:0{width}d}{m.group(2)}"
-    _, ext = os.path.splitext(name)
-    return f"{global_idx:06d}_{local_idx:06d}{ext}"
-
-
-def merge_extracted_images(
-    chunk_metas: List[ChunkMeta],
-    out_dir: str,
-    overlap_policy: str,
-) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    copied_count = 0
-    patterns = ["*.jpg", "*.png", "*.jpeg"]
-
-    for meta in chunk_metas:
-        img_dir = os.path.join(meta.seq_dir, "extracted_images")
-        if not os.path.isdir(img_dir):
-            log(f"[merge] Skip chunk with no extracted_images: {meta.chunk_path}")
-            continue
-
-        image_files: List[str] = []
-        for pat in patterns:
-            image_files.extend(glob.glob(os.path.join(img_dir, pat)))
-        image_files = sorted(image_files)
-        if not image_files:
-            continue
-
-        for i, fp in enumerate(image_files):
-            global_idx = meta.offset + i
-            dst_name = _renumber_image_name(fp, global_idx, i)
-            dst_path = os.path.join(out_dir, dst_name)
-
-            if os.path.exists(dst_path):
-                if overlap_policy == "keep_first":
-                    continue
-                os.remove(dst_path)
-
-            shutil.copy2(fp, dst_path)
-            copied_count += 1
-
-    if copied_count == 0:
-        log("[merge] No extracted_images chunks found to copy")
-        return
-    log(f"[merge] Copied {copied_count} extracted image files into {out_dir}")
 
 
 def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) -> Optional[str]:
@@ -543,26 +352,19 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
     return out_path
 
 
-def build_chunk_meta(chunks: List[str], seq_dirs: List[str]) -> List[ChunkMeta]:
+def build_chunk_meta(windows: List[Tuple[int, int]], seq_dirs: List[str]) -> List[ChunkMeta]:
+    # The global frame offset is simply the window start index (deterministic, no
+    # frame counting required).
     metas: List[ChunkMeta] = []
-    offset = 0
-
-    for chunk_path, seq_dir in zip(chunks, seq_dirs):
-        frame_count = count_extracted_frames(seq_dir)
-        if frame_count <= 0:
-            cam_space_dir = os.path.join(seq_dir, "cam_space")
-            frame_count = chunk_local_span(cam_space_dir)
-
+    for (start, end), seq_dir in zip(windows, seq_dirs):
         metas.append(
             ChunkMeta(
-                chunk_path=chunk_path,
+                chunk_path=seq_dir,
                 seq_dir=seq_dir,
-                offset=offset,
-                frame_count=frame_count,
+                offset=start,
+                frame_count=end - start,
             )
         )
-        offset += frame_count
-
     return metas
 
 
@@ -596,7 +398,6 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
     else:
         work_root = os.path.join(os.path.dirname(video_abs), f"{video_stem}_segmented")
 
-    chunks_dir = os.path.join(work_root, "chunks")
     merged_root = os.path.join(work_root, "merged")
     os.makedirs(work_root, exist_ok=True)
 
@@ -605,48 +406,42 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
     log(f"[video] {video_abs}")
     log(f"[work ] {work_root}")
 
-    if args.skip_split:
-        chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
-        if not chunks:
-            raise RuntimeError(f"No chunks found in {chunks_dir}; cannot --skip_split")
-        log(f"[split] skip, found {len(chunks)} chunks")
-    else:
-        ensure_ffmpeg_exists()
-        chunks = split_video(
-            video_path=video_abs,
-            chunks_dir=chunks_dir,
-            segment_seconds=args.segment_seconds,
-            min_last_segment_seconds=args.min_last_segment_seconds,
-            reencode=args.reencode,
-            overwrite=args.overwrite_chunks,
-        )
-        log(f"[split] generated {len(chunks)} chunks")
+    # Plan consecutive frame-index windows over the (resampled) video timeline.
+    chunk_frames = max(1, int(round(args.segment_seconds * args.target_fps)))
+    min_last_frames = max(0, int(round(args.min_last_segment_seconds * args.target_fps)))
+    n_frames = count_frames(video_abs, args.target_fps)
+    windows = compute_windows(n_frames, chunk_frames, min_last_frames)
+    if not windows:
+        raise RuntimeError(f"No frames decoded from {video_abs}")
+    log(f"[plan ] {n_frames} frames @ {args.target_fps}fps -> {len(windows)} windows")
 
-    seq_dirs: List[str] = []
+    seq_dirs: List[str] = [os.path.join(work_root, f"chunk_{i:06d}") for i in range(len(windows))]
+
     if args.skip_demo:
-        for chunk in chunks:
-            seq_dir = os.path.join(os.path.dirname(chunk), seq_name_for_video(chunk))
+        for seq_dir in seq_dirs:
             if not os.path.isdir(seq_dir):
-                raise RuntimeError(f"Missing seq_dir for chunk (cannot --skip_demo): {seq_dir}")
-            seq_dirs.append(seq_dir)
+                raise RuntimeError(f"Missing seq_dir (cannot --skip_demo): {seq_dir}")
         log("[demo ] skip")
     else:
-        for i, chunk in enumerate(chunks):
-            log(f"[demo ] chunk {i + 1}/{len(chunks)}")
-            seq_dir = run_demo_on_chunk(
-                chunk_path=chunk,
+        for i, ((start, end), seq_dir) in enumerate(zip(windows, seq_dirs)):
+            log(f"[demo ] window {i + 1}/{len(windows)} frames [{start}, {end})")
+            run_demo_on_chunk(
+                video_abs=video_abs,
+                seq_dir=seq_dir,
+                frame_start=start,
+                frame_end=end,
+                target_fps=args.target_fps,
                 project_dir=project_dir,
                 python_bin=args.python_bin,
                 vis_mode=args.vis_mode,
                 gpu_id=args.gpu_id,
             )
-            seq_dirs.append(seq_dir)
 
     if args.skip_merge:
         log("[merge] skip")
         return
 
-    metas = build_chunk_meta(chunks, seq_dirs)
+    metas = build_chunk_meta(windows, seq_dirs)
     manifest_path = os.path.join(work_root, "chunk_manifest.json")
     write_manifest(manifest_path, video_abs, metas)
 
@@ -654,13 +449,6 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
     merge_cam_space(
         chunk_metas=metas,
         out_dir=merged_cam_dir,
-        overlap_policy=args.overlap_policy,
-    )
-
-    merged_img_dir = os.path.join(merged_root, "extracted_images")
-    merge_extracted_images(
-        chunk_metas=metas,
-        out_dir=merged_img_dir,
         overlap_policy=args.overlap_policy,
     )
 
@@ -698,20 +486,6 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
             shutil.copy2(merged_slam_file, slam_dst)
             log(f"[copy ] {slam_dst}")
 
-        orig_img_dir = os.path.join(orig_seq_dir, "extracted_images")
-        os.makedirs(orig_img_dir, exist_ok=True)
-        for fn in sorted(os.listdir(merged_img_dir)) if os.path.isdir(merged_img_dir) else []:
-            src = os.path.join(merged_img_dir, fn)
-            if not os.path.isfile(src):
-                continue
-            dst = os.path.join(orig_img_dir, fn)
-            if os.path.exists(dst):
-                if args.overlap_policy == "keep_first":
-                    continue
-                os.remove(dst)
-            shutil.copy2(src, dst)
-            log(f"[copy ] {dst}")
-
         log(f"[done ] merged cam_space available at: {target_dir}")
     else:
         log(f"[done ] merged results at: {merged_root} (copy-back skipped)")
@@ -741,15 +515,14 @@ def make_parser() -> argparse.ArgumentParser:
     src.add_argument("--video_path", type=str, help="Single input video path")
     src.add_argument("--video_dir", type=str, help="Recursively process all .mp4 in directory")
 
-    p.add_argument("--segment_seconds", type=int, default=120, help="Chunk duration in seconds")
+    p.add_argument("--segment_seconds", type=int, default=120, help="Window duration in seconds (converted to frames via --target_fps)")
     p.add_argument(
         "--min_last_segment_seconds",
         type=int,
         default=10,
-        help="Minimum allowed duration (seconds) for the final chunk; if shorter, merge into previous chunk",
+        help="Minimum allowed duration (seconds) for the final window; if shorter, merge into previous window",
     )
-    p.add_argument("--reencode", action="store_true", help="Use re-encoding split for exact cut boundaries")
-    p.add_argument("--overwrite_chunks", action="store_true", help="Delete existing chunk_*.mp4 before splitting")
+    p.add_argument("--target_fps", type=float, default=30, help="Decode/resample fps (matches old ffmpeg fps=N); passed to demo.py")
 
     p.add_argument("--python_bin", type=str, default=sys.executable, help="Python executable for demo.py")
     p.add_argument("--vis_mode", type=str, default="off", help="demo.py --vis_mode value")
@@ -762,7 +535,13 @@ def make_parser() -> argparse.ArgumentParser:
                         "(required when the video lives on an s3mount target)")
     p.add_argument("--overlap_policy", choices=["keep_last", "keep_first"], default="keep_last")
 
-    p.add_argument("--skip_split", action="store_true")
+    # Deprecated no-ops kept for backward compatibility with existing launchers.
+    # The pipeline no longer splits the video into chunk files; it decodes
+    # frame-index windows on demand instead.
+    p.add_argument("--reencode", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--overwrite_chunks", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--skip_split", action="store_true", help=argparse.SUPPRESS)
+
     p.add_argument("--skip_demo", action="store_true")
     p.add_argument("--skip_merge", action="store_true")
 

@@ -560,8 +560,17 @@ def main():
         "--target_images_dir",
         type=str,
         default="extracted_images_50fps",
-        help="Target frame folder name under folder_path",
+        help="Target frame folder name under folder_path (legacy; ignored when --video_path is given)",
     )
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Source video. When provided, source/target frame counts are derived by "
+             "decoding the video at --source_fps/--target_fps instead of counting JPEGs on disk.",
+    )
+    parser.add_argument("--source_fps", type=float, default=30, help="Source timeline fps (matches reconstruction fps)")
+    parser.add_argument("--target_fps", type=float, default=50, help="Target (interpolated) timeline fps")
     parser.add_argument(
         "--output_name",
         type=str,
@@ -580,15 +589,23 @@ def main():
     # if not os.path.exists(in_path):
     #     raise FileNotFoundError(f"Input file not found: {in_path}")
 
-    source_dir = os.path.join(args.folder_path, args.source_images_dir)
-    target_dir = os.path.join(args.folder_path, args.target_images_dir)
-    if not os.path.isdir(source_dir):
-        raise FileNotFoundError(f"Source image folder not found: {source_dir}")
-    if not os.path.isdir(target_dir):
-        raise FileNotFoundError(f"Target image folder not found: {target_dir}")
-
-    src_frame_count = _count_images(source_dir)
-    dst_frame_count = _count_images(target_dir)
+    if args.video_path:
+        # Derive frame counts by decoding the video on demand (no JPEGs on disk).
+        import sys
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from lib.pipeline.frame_source import FrameSource
+        src_frame_count = len(FrameSource(args.video_path, target_fps=args.source_fps))
+        dst_frame_count = len(FrameSource(args.video_path, target_fps=args.target_fps))
+    else:
+        # Legacy path: count extracted JPEGs.
+        source_dir = os.path.join(args.folder_path, args.source_images_dir)
+        target_dir = os.path.join(args.folder_path, args.target_images_dir)
+        if not os.path.isdir(source_dir):
+            raise FileNotFoundError(f"Source image folder not found: {source_dir}")
+        if not os.path.isdir(target_dir):
+            raise FileNotFoundError(f"Target image folder not found: {target_dir}")
+        src_frame_count = _count_images(source_dir)
+        dst_frame_count = _count_images(target_dir)
 
     # world_data = joblib.load(in_path)
     # interp_data = interpolate_world_space(world_data, src_frame_count, dst_frame_count)

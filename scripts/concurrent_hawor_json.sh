@@ -51,8 +51,8 @@ for task in $(find "$CLIP1_DIR" -type f -iname "*.mp4"); do
     (
         export CUDA_VISIBLE_DEVICES=$GPU_ID
         python demo.py --video_path "$task" --vis_mode off 2>&1 | tee -a "$LOG_FILE"
-        python scripts/extract_image_50fps.py --video_path "$task"  --output_folder "$folder_name/extracted_images_50fps" 2>&1 | tee -a "$LOG_FILE"
-        python scripts/interpolation.py --folder_path "$folder_name" 2>&1 | tee -a "$LOG_FILE"
+        # Frames are decoded on demand; interpolation derives the 50fps count from the video.
+        python scripts/interpolation.py --folder_path "$folder_name" --video_path "$task" 2>&1 | tee -a "$LOG_FILE"
     ) &
 
     # 控制同时后台任务不超过 MAX_JOBS

@@ -15,6 +15,7 @@ from PIL import Image
 from glob import glob
 from pycocotools import mask as masktool
 from lib.pipeline.masked_droid_slam import *
+from lib.pipeline.frame_source import frame_source_from_args
 from lib.pipeline.est_scale import *
 from hawor.utils.process import block_print, enable_print
 
@@ -48,16 +49,14 @@ def hawor_slam(args, start_idx, end_idx):
     file = args.video_path
     video_root = os.path.dirname(file)
     video = os.path.basename(file).split('.')[0]
-    seq_folder = os.path.join(video_root, video)
+    seq_folder = args.seq_dir if getattr(args, 'seq_dir', None) else os.path.join(video_root, video)
     os.makedirs(seq_folder, exist_ok=True)
-    video_folder = os.path.join(video_root, video)
+    video_folder = seq_folder
 
-    img_folder = f'{video_folder}/extracted_images'
-    imgfiles = natsorted(glob(f'{img_folder}/*.jpg'))
+    # Frames decoded on demand (BGR, matching the original cv2.imread path).
+    frame_source = frame_source_from_args(args, color='bgr')
+    height, width = frame_source.frame_shape
 
-    first_img = cv2.imread(imgfiles[0])
-    height, width, _ = first_img.shape
-    
     print(f'Running slam on {video_folder} ...')
 
     ##### Run SLAM #####
@@ -79,12 +78,12 @@ def hawor_slam(args, start_idx, end_idx):
             focal = 600
             with open(os.path.join(video_folder, 'est_focal.txt'), 'w') as file:
                 file.write(str(focal))
-    calib = np.array(est_calib(imgfiles)) # [focal, focal, cx, cy]
-    center = calib[2:]        
+    calib = np.array(est_calib(frame_source)) # [focal, focal, cx, cy]
+    center = calib[2:]
     calib[:2] = focal
-    
+
     # Droid-slam with masking
-    droid, traj = run_slam(imgfiles, masks=masks, calib=calib)
+    droid, traj = run_slam(frame_source, masks=masks, calib=calib)
     n = droid.video.counter.value
     tstamp = droid.video.tstamp.cpu().int().numpy()[:n]
     disps = droid.video.disps_up.cpu().numpy()[:n]
@@ -102,9 +101,11 @@ def hawor_slam(args, start_idx, end_idx):
 
     print('Predicting Metric Depth ...')
     pred_depths = []
-    H, W = get_dimention(imgfiles)
+    H, W = get_dimention(frame_source)
     for t in tqdm(tstamp):
-        pred_depth = metric(imgfiles[t], calib)
+        # Metric3D expects an RGB image (it reads paths via PIL); flip from BGR.
+        frame_rgb = np.ascontiguousarray(frame_source[int(t)][:, :, ::-1])
+        pred_depth = metric(frame_rgb, calib)
         pred_depth = cv2.resize(pred_depth, (W, H))
         pred_depths.append(pred_depth)
 

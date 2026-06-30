@@ -4,25 +4,8 @@ sys.path.insert(0, os.path.dirname(__file__) + '/../..')
 
 import argparse
 import numpy as np
-from glob import glob
 from lib.pipeline.tools import detect_track
-from natsort import natsorted
-import subprocess
-
-
-def extract_frames(video_path, output_folder):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    command = [
-        'ffmpeg',               
-        '-i', video_path,       
-        '-vf', 'fps=30',         
-        '-start_number', '0',
-        os.path.join(output_folder, '%04d.jpg')  
-    ]
-
-    subprocess.run(command, check=True)
+from lib.pipeline.frame_source import frame_source_from_args
 
 
 def detect_track_video(args):
@@ -30,37 +13,29 @@ def detect_track_video(args):
     root = os.path.dirname(file)
     seq = os.path.basename(file).split('.')[0]
 
-    seq_folder = f'{root}/{seq}'
-    img_folder = f'{seq_folder}/extracted_images'
+    seq_folder = args.seq_dir if getattr(args, 'seq_dir', None) else f'{root}/{seq}'
     os.makedirs(seq_folder, exist_ok=True)
-    os.makedirs(img_folder, exist_ok=True)
     print(f'Running detect_track on {file} ...')
 
-    ##### Extract Frames #####
-    imgfiles = natsorted(glob(f'{img_folder}/*.jpg'))
-    # print(imgfiles[:10])
-    if len(imgfiles) > 0:
-        print("Skip extracting frames")
-    else:
-        _ = extract_frames(file, img_folder)
-    imgfiles = natsorted(glob(f'{img_folder}/*.jpg'))
+    ##### Decode frames on demand (no JPEG dump to disk) #####
+    frame_source = frame_source_from_args(args, color='bgr')
 
     ##### Detection + Track #####
     print('Detect and Track ...')
 
     start_idx = 0
-    end_idx = len(imgfiles)
+    end_idx = len(frame_source)
 
     if os.path.exists(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_boxes.npy'):
         print(f"skip track for {start_idx}_{end_idx}")
-        return start_idx, end_idx, seq_folder, imgfiles
+        return start_idx, end_idx, seq_folder, frame_source
     os.makedirs(f"{seq_folder}/tracks_{start_idx}_{end_idx}", exist_ok=True)
-    # boxes_, tracks_ = detect_track(imgfiles, thresh=0.2)
-    boxes_, tracks_ = detect_track(imgfiles, thresh=0.3)
+    # boxes_, tracks_ = detect_track(frame_source, thresh=0.2)
+    boxes_, tracks_ = detect_track(frame_source, thresh=0.3)
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_boxes.npy', boxes_)
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_tracks.npy', tracks_)
 
-    return start_idx, end_idx, seq_folder, imgfiles
+    return start_idx, end_idx, seq_folder, frame_source
 
 if __name__ == '__main__':
 
