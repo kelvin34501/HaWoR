@@ -191,6 +191,7 @@ class HaWoRVideoProcessor:
             str(gpu_id),
             "--work_dir",
             str(work_dir),
+            "--skip_copy_back",
         ]
         if self.config.split_mode == "reencode":
             cmd.append("--reencode")
