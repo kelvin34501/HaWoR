@@ -56,6 +56,11 @@ class _FrameSubset:
 
     Quacks like the old ``imgfiles[frame_ck]`` numpy slice: supports ``len()`` and
     integer indexing returning a decoded frame, plus further sub-indexing.
+
+    ``indices`` are *virtual* full-timeline indices (the same space callers index
+    ``FrameSource`` with), NOT native frame indices. Decoding routes back through
+    ``parent[...]`` so the parent's ``index_map`` is applied exactly once; storing
+    pre-mapped native indices here would double-apply it.
     """
 
     def __init__(self, parent, indices):
@@ -190,12 +195,17 @@ class FrameSource:
         return len(self._index_map)
 
     def __getitem__(self, key):
+        # `_FrameSubset` stores *virtual* (full-timeline) indices, not native ones:
+        # decoding a subset element routes back through this method, which applies
+        # `self._index_map` exactly once. Pre-mapping here would map twice (the
+        # subset index then this index), reading the wrong native frame whenever
+        # the map is non-identity (target_fps != native_fps).
         if isinstance(key, slice):
             idx = np.arange(len(self))[key]
-            return _FrameSubset(self, self._index_map[idx])
+            return _FrameSubset(self, idx)
         if isinstance(key, (list, np.ndarray)):
             idx = np.asarray(key, dtype=np.int64)
-            return _FrameSubset(self, self._index_map[idx])
+            return _FrameSubset(self, idx)
         if key < 0:
             key += len(self)
         return self._read_native(int(self._index_map[key]))

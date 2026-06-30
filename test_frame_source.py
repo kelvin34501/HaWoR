@@ -41,10 +41,13 @@ def check_fps(video_path, fps, sample=12, require_alignment=True):
     """Verify frame count and (for the processing fps) temporal alignment.
 
     Note: ffmpeg writes lossy JPEGs which we re-read, while FrameSource returns the
-    raw decoded frame, so absolute pixel diffs of ~5-15 are expected (JPEG loss +
-    YUV->RGB colorspace/range differences between the two decoders). The real
-    correctness check is alignment: FrameSource[i] must match ffmpeg frame i better
-    than its neighbours i-1 / i+1 (i.e. no off-by-one / temporal drift).
+    raw decoded frame, so small absolute pixel diffs are expected from JPEG loss.
+    With the default ffmpeg backend both sides use the same decoder, so the
+    per-channel signed bias below should be ~0; a large constant bias indicates a
+    YUV range/matrix mismatch (this is what the decord backend exhibited and what
+    corrupted detection/depth). The real correctness check is alignment:
+    FrameSource[i] must match ffmpeg frame i better than its neighbours i-1 / i+1
+    (i.e. no off-by-one / temporal drift).
 
     `require_alignment` is True for the processing fps (30) -- the frames actually
     fed to detection/SLAM/motion, which must reproduce the old ffmpeg dump exactly.
@@ -108,4 +111,20 @@ if __name__ == "__main__":
     if len(win) > 0:
         assert np.array_equal(win[0], full[5]) and np.array_equal(win[-1], full[5 + len(win) - 1])
     print("[window] OK")
+
+    # Fancy/array indexing (the path motion estimation uses via `frame_source[frame_ck]`)
+    # must apply the fps index_map exactly once -- i.e. agree with integer access for
+    # the same virtual indices. Use non-monotonic indices spanning the timeline so a
+    # double-mapping (index_map[index_map[i]]) would diverge or go out of bounds.
+    # `require_alignment` resamples; pick a resample fps != native so the map is non-trivial.
+    rs = FrameSource(args.video_path, target_fps=24, color="bgr")
+    if len(rs) >= 6:
+        picks = [len(rs) - 1, 0, len(rs) // 2, 3]
+        sub = rs[picks]
+        for k, v in enumerate(picks):
+            assert np.array_equal(sub[k], rs[v]), f"fancy index {v} != integer index {v}"
+        # nested sub-indexing must stay consistent too
+        sub2 = sub[1:3]
+        assert np.array_equal(sub2[0], rs[picks[1]]) and np.array_equal(sub2[1], rs[picks[2]])
+    print("[fancy-index] OK")
     print("ALL FRAME SOURCE CHECKS PASSED")
