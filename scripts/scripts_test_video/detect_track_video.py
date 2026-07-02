@@ -28,6 +28,7 @@ def detect_track_video(args):
 
     if os.path.exists(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_boxes.npy'):
         print(f"skip track for {start_idx}_{end_idx}")
+        frame_source.close()  # release decord buffers; reopens lazily if reused
         return start_idx, end_idx, seq_folder, frame_source
     os.makedirs(f"{seq_folder}/tracks_{start_idx}_{end_idx}", exist_ok=True)
     # boxes_, tracks_ = detect_track(frame_source, thresh=0.2)
@@ -35,6 +36,7 @@ def detect_track_video(args):
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_boxes.npy', boxes_)
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_tracks.npy', tracks_)
 
+    frame_source.close()  # release decord buffers; reopens lazily if reused
     return start_idx, end_idx, seq_folder, frame_source
 
 if __name__ == '__main__':

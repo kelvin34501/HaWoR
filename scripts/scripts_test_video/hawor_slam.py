@@ -140,10 +140,12 @@ def hawor_slam(args, start_idx, end_idx):
     # Save results
     os.makedirs(f"{seq_folder}/SLAM", exist_ok=True)
     save_path = f'{seq_folder}/SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz'
-    np.savez(save_path, 
-            tstamp=tstamp, disps=disps, traj=traj, 
+    np.savez(save_path,
+            tstamp=tstamp, disps=disps, traj=traj,
             img_focal=focal, img_center=calib[-2:],
-            scale=median_s)    
+            scale=median_s)
+
+    frame_source.close()  # release decord buffers held during SLAM/Metric3D
 
 
 
