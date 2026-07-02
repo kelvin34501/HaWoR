@@ -68,6 +68,7 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
     if os.path.exists(f'{seq_folder}/tracks_{start_idx}_{end_idx}/frame_chunks_all.npy'):
         print("skip hawor motion estimation")
         frame_chunks_all = joblib.load(f'{seq_folder}/tracks_{start_idx}_{end_idx}/frame_chunks_all.npy')
+        frame_source.close()  # release decord buffers; reopens lazily if reused
         return frame_chunks_all, img_focal
 
     print(f'Running hawor on {video} ...')
@@ -94,7 +95,10 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
 
     H, W = frame_source.frame_shape
     img_center = [W / 2, H / 2]# w/2, h/2
-    model_masks = np.zeros((len(frame_source), H, W))
+    # bool, not float64: this array is (num_frames, native_H, native_W) and is
+    # only ever thresholded to a boolean silhouette below, so float64 wastes 8x
+    # RAM (~200G for a long 4K chunk). `mask` from the renderer is already bool.
+    model_masks = np.zeros((len(frame_source), H, W), dtype=bool)
 
     bin_size = 128
     max_faces_per_bin = 20000
@@ -211,11 +215,11 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
                 vertices_i = vertices[[img_i]]
                 rend, mask = renderer.render_multiple(vertices_i.unsqueeze(0).cuda(), faces, verts_color.unsqueeze(0).cuda(), cameras, lights)
                 
-                model_masks[frame_ck[img_i]] += mask
-                
-    model_masks = model_masks > 0 # bool
+                model_masks[frame_ck[img_i]] |= mask
+
     np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_masks.npy', model_masks)
     joblib.dump(frame_chunks_all, f'{seq_folder}/tracks_{start_idx}_{end_idx}/frame_chunks_all.npy')
+    frame_source.close()  # release decord buffers held during motion estimation
     return frame_chunks_all, img_focal
 
 def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
