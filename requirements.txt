@@ -1,6 +1,7 @@
 numpy==1.26.4
 opencv-python
 decord  # on-demand video frame decoding (FrameSource); avoids extracting JPEGs to disk
+h5py  # chunked on-disk mask store (model_masks.h5); streamed so masks are never fully in RAM
 pyrender
 scikit-image
 smplx==0.1.28

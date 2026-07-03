@@ -3,6 +3,7 @@ from collections import defaultdict
 import json
 import os
 import joblib
+import h5py
 import numpy as np
 import torch
 import cv2
@@ -95,10 +96,18 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
 
     H, W = frame_source.frame_shape
     img_center = [W / 2, H / 2]# w/2, h/2
-    # bool, not float64: this array is (num_frames, native_H, native_W) and is
-    # only ever thresholded to a boolean silhouette below, so float64 wastes 8x
-    # RAM (~200G for a long 4K chunk). `mask` from the renderer is already bool.
-    model_masks = np.zeros((len(frame_source), H, W), dtype=bool)
+    # Accumulate silhouettes straight into an on-disk HDF5 dataset (chunked per
+    # frame, gzip-compressed) rather than a full (num_frames, native_H, native_W)
+    # array in RAM: that array is native-resolution and, for a long/high-res chunk,
+    # dwarfs everything else on the host. The `|=` below reads a single frame chunk,
+    # ORs, and writes it back, so only one frame is ever resident. Unwritten frames
+    # read back as fill 0, matching the old np.zeros default. SLAM reads this file
+    # back frame-by-frame (see hawor_slam.py / masked_droid_slam.run_slam).
+    mask_h5_path = f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_masks.h5'
+    mask_file = h5py.File(mask_h5_path, 'w')
+    model_masks = mask_file.create_dataset(
+        'masks', shape=(len(frame_source), H, W), dtype=bool,
+        chunks=(1, H, W), compression='gzip')
 
     bin_size = 128
     max_faces_per_bin = 20000
@@ -217,7 +226,7 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
                 
                 model_masks[frame_ck[img_i]] |= mask
 
-    np.save(f'{seq_folder}/tracks_{start_idx}_{end_idx}/model_masks.npy', model_masks)
+    mask_file.close()  # masks already persisted incrementally into the HDF5 dataset
     joblib.dump(frame_chunks_all, f'{seq_folder}/tracks_{start_idx}_{end_idx}/frame_chunks_all.npy')
     frame_source.close()  # release decord buffers held during motion estimation
     return frame_chunks_all, img_focal

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(__file__) + '/../..')
 
 import argparse
 from tqdm import tqdm
+import h5py
 import numpy as np
 import torch
 import cv2
@@ -61,8 +62,10 @@ def hawor_slam(args, start_idx, end_idx):
 
     ##### Run SLAM #####
     # Use Masking
-    masks = np.load(f'{video_folder}/tracks_{start_idx}_{end_idx}/model_masks.npy', allow_pickle=True)
-    masks = torch.from_numpy(masks)
+    # Native-resolution silhouettes, streamed frame-by-frame from disk (never loaded
+    # in full). `masks[i]` -> (H0, W0) bool ndarray; run_slam resizes per frame.
+    mask_file = h5py.File(f'{video_folder}/tracks_{start_idx}_{end_idx}/model_masks.h5', 'r')
+    masks = mask_file['masks']
     print(masks.shape)
 
     # Camera calibration (intrinsics) for SLAM
@@ -126,7 +129,7 @@ def hawor_slam(args, start_idx, end_idx):
         slam_depth = 1/disp
         
         # Estimate scene scale
-        msk = masks[t].numpy().astype(np.uint8)
+        msk = np.asarray(masks[int(t)]).astype(np.uint8)
         scale = est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=msk, near_thresh=min_threshold, far_thresh=max_threshold)  
         while math.isnan(scale):
             min_threshold -= 0.1
@@ -145,6 +148,7 @@ def hawor_slam(args, start_idx, end_idx):
             img_focal=focal, img_center=calib[-2:],
             scale=median_s)
 
+    mask_file.close()
     frame_source.close()  # release decord buffers held during SLAM/Metric3D
 
 

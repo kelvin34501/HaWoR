@@ -141,33 +141,44 @@ def image_stream(imagedir, calib, stride, max_frame=None):
         yield t, image[None], intrinsics
 
 
-def run_slam(imagedir, masks, calib=None, depth=None, stride=1,  
+def run_slam(imagedir, masks, calib=None, depth=None, stride=1,
              filter_thresh=2.4, disable_vis=True):
-    """ Maksed DROID-SLAM """
+    """ Maksed DROID-SLAM.
+
+    ``masks`` is a per-frame silhouette source indexed as ``masks[i] -> (H0, W0)``
+    native-resolution mask. It may be an in-RAM tensor/ndarray or an h5py dataset
+    streamed from disk. Each frame is resized to DROID resolution on read, so the
+    full native-resolution volume is never materialized. Resizing frame ``t`` in
+    isolation is bit-identical to the batched ``preprocess_masks`` result for ``t``
+    (torchvision ``Resize`` operates per image).
+    """
     droid = None
     depth = None
     ##hack for passing args to droid
     filter_thresh=1.5
     args.filter_thresh = filter_thresh
     args.disable_vis = disable_vis
-    masks = masks[::stride]
 
-    img_msks, conf_msks = preprocess_masks(imagedir, masks)
     if calib is None:
         calib = est_calib(imagedir)
+
+    H, W = get_dimention(imagedir)
+    resize_1 = Resize((H, W), antialias=True)
+    resize_2 = Resize((H // 8, W // 8), antialias=True)
 
     for (t, image, intrinsics) in tqdm(image_stream(imagedir, calib, stride)):
 
         if droid is None:
             args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(args)
-        
-        img_msk = img_msks[t]
-        conf_msk = conf_msks[t]
+
+        m = torch.from_numpy(np.ascontiguousarray(masks[t * stride]))
+        img_msk = resize_1(m)
+        conf_msk = resize_2(m)
         image = image * (img_msk < 0.5)
         # cv2.imwrite('debug.png', image[0].permute(1, 2, 0).numpy())
 
-        droid.track(t, image, intrinsics=intrinsics, depth=depth, mask=conf_msk)  
+        droid.track(t, image, intrinsics=intrinsics, depth=depth, mask=conf_msk)
 
     traj = droid.terminate(image_stream(imagedir, calib, stride))
 
