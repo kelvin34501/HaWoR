@@ -1,9 +1,41 @@
-import argparse
-import sys
 import os
+import sys
+
+# glibc reads MALLOC_* tunables once, at process startup (before any Python code
+# runs), so setting them via os.environ here would be too late. Re-exec the
+# interpreter once with them applied instead: MALLOC_ARENA_MAX=2 collapses the
+# many per-thread malloc arenas -- whose stranded free lists ballooned host RSS
+# to ~70 GiB on a 3000-frame 4K window -- down to 2, and MALLOC_TRIM_THRESHOLD_=0
+# makes free() hand pages back to the OS. This alone dropped the measured peak to
+# ~31 GiB. Any value the caller already exported is respected; the sentinel env
+# var prevents an exec loop.
+_mem_defaults = {"MALLOC_ARENA_MAX": "2", "MALLOC_TRIM_THRESHOLD_": "0"}
+_mem_missing = {k: v for k, v in _mem_defaults.items() if k not in os.environ}
+if _mem_missing and not os.environ.get("_HAWOR_MALLOC_TUNED"):
+    os.environ.update(_mem_missing)
+    os.environ["_HAWOR_MALLOC_TUNED"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import argparse
+import ctypes
+import ctypes.util
+import gc
 import time
 
+# Cap intra-op CPU thread pools BEFORE torch/numpy import their BLAS backends
+# (OMP/MKL/OpenBLAS read these env vars once, at first use). Oversubscribed pools
+# on a many-core node both waste CPU and multiply glibc malloc arenas, whose
+# stranded per-arena free lists are what balloon RSS (see MALLOC_ARENA_MAX in the
+# launch scripts). Respect any value the caller already exported.
+_thread_cap = os.environ.get("HAWOR_NUM_THREADS")
+if not _thread_cap:
+    _thread_cap = str(min(8, os.cpu_count() or 8))
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, _thread_cap)
+
 import torch
+torch.set_num_threads(int(_thread_cap))
 sys.path.insert(0, os.path.dirname(__file__))
 import numpy as np
 import joblib
@@ -14,6 +46,28 @@ from lib.pipeline.frame_source import frame_source_from_args
 from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
 from lib.eval_utils.custom_utils import load_slam_cam
 from lib.vis.run_vis2 import run_vis2_on_video, run_vis2_on_video_cam
+
+
+_libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+
+def reclaim_memory():
+    """Drop dead buffers between pipeline stages and return pages to the OS.
+
+    Each stage churns through large transient host buffers (decoded 4K frames,
+    crops, render targets). Once a stage returns they are unreferenced, but
+    glibc keeps them on per-arena free lists so RSS never falls -- the next
+    stage then stacks its peak on top. gc.collect() breaks any ref cycles,
+    empty_cache() frees the CUDA caching allocator, and malloc_trim(0) hands
+    the freed top-of-heap pages back to the OS so the peak doesn't accumulate.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        _libc.malloc_trim(0)
+    except AttributeError:
+        pass  # non-glibc allocator: no malloc_trim
 
 
 if __name__ == '__main__':
@@ -34,11 +88,13 @@ if __name__ == '__main__':
     start_idx, end_idx, seq_folder, frame_source = detect_track_video(args)
     elapsed = time.perf_counter() - start
     print(f"Detection and tracking time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
+    reclaim_memory()  # release detect/track host buffers before motion estimation stacks on top
 
     start = time.perf_counter()
     frame_chunks_all, img_focal = hawor_motion_estimation(args, start_idx, end_idx, seq_folder)
     elapsed = time.perf_counter() - start
     print(f"Motion estimation time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
+    reclaim_memory()  # release motion-estimation host buffers before SLAM
 
     slam_path = os.path.join(seq_folder, f"SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     if not os.path.exists(slam_path):
@@ -46,6 +102,7 @@ if __name__ == '__main__':
         hawor_slam(args, start_idx, end_idx)
         elapsed = time.perf_counter() - start
         print(f"SLAM time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
+        reclaim_memory()  # release SLAM/Metric3D host buffers before infilling
     slam_path = os.path.join(seq_folder, f"SLAM/hawor_slam_w_scale_{start_idx}_{end_idx}.npz")
     R_w2c_sla_all, t_w2c_sla_all, R_c2w_sla_all, t_c2w_sla_all = load_slam_cam(slam_path)
 
@@ -53,6 +110,7 @@ if __name__ == '__main__':
     pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid = hawor_infiller(args, start_idx, end_idx, frame_chunks_all)
     elapsed = time.perf_counter() - start
     print(f"Infilling time: {elapsed:.4f} seconds, num frames: {end_idx - start_idx}")
+    reclaim_memory()  # release infiller host buffers before (optional) visualization
     # vis sequence for this video
     hand2idx = {
         "right": 1,

@@ -172,9 +172,14 @@ def run_slam(imagedir, masks, calib=None, depth=None, stride=1,
             args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(args)
 
-        m = torch.from_numpy(np.ascontiguousarray(masks[t * stride]))
-        img_msk = resize_1(m)
-        conf_msk = resize_2(m)
+        # Add a leading channel dim: torchvision Resize treats a 2D (H0, W0)
+        # tensor as (channels, W) -> one spatial dim and errors; (1, H0, W0) is
+        # resized over the trailing 2 dims exactly as the old batched
+        # preprocess_masks did (N, H0, W0). Drop the dim to match the old
+        # img_msks[t] / conf_msks[t] shapes: (H, W) and (H//8, W//8).
+        m = torch.from_numpy(np.ascontiguousarray(masks[t * stride]))[None]
+        img_msk = resize_1(m)[0]
+        conf_msk = resize_2(m)[0]
         image = image * (img_msk < 0.5)
         # cv2.imwrite('debug.png', image[0].permute(1, 2, 0).numpy())
 

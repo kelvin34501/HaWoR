@@ -112,7 +112,7 @@ class FrameSource:
         # with its own frame buffers; on a many-core node that alone balloons RAM.
         # Cap it (env override for the service). See _reader().
         if num_threads is None:
-            num_threads = int(os.environ.get("HAWOR_DECORD_NUM_THREADS", 4))
+            num_threads = int(os.environ.get("HAWOR_DECORD_NUM_THREADS", 2))
         self.num_threads = max(1, int(num_threads))
         # Flush interval: drop & reopen the decord reader after this many decoded
         # frames so its internal decode/seek buffers can't grow without bound.
