@@ -221,6 +221,8 @@ def construct_viewer_meshes(data, draw_edges=False, flat_shading=True):
             material=mesh_material,
             # rotation=rotation_flip,
         )
+        if val.get("double_sided"):
+            meshes[key].backface_culling = False
     return meshes
 
 

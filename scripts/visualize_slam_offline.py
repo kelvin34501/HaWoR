@@ -1,0 +1,446 @@
+"""Visualize offline HaWoR results: SLAM camera trajectory + 3D hand meshes in world space.
+
+Runs purely from a processed seq folder (no detection/tracking/SLAM rerun):
+
+    <seq_dir>/cam_space/<tid>/<start>_<end>.json   raw camera-space MANO chunks
+    <seq_dir>/SLAM/hawor_slam_w_scale_<s>_<e>.npz  scaled camera trajectory
+    <seq_dir>/world_space_res.pth                  (optional) infilled world-space result
+
+Renders an aitviewer scene (y-up = first-frame camera up) with both hand
+meshes, a wireframe camera frustum, and a world-axis triad. By default the
+view is follow-cam: the SLAM camera is pinned at the scene center each frame
+and the hands move relative to it (--no_follow for the absolute world frame).
+
+- If world_space_res.pth is missing, the motion infiller is run offline: the
+  chunk frame ranges are recovered from the cam_space filenames, so only the
+  infiller checkpoint and the source video (for the frame count) are needed.
+  The rebuilt world_space_res.pth is saved back for next time.
+- Merged segmented trajectories are stitched automatically: each window's SLAM
+  run restarts at the origin, so window restarts are detected and chained into
+  one continuous world frame (approximate at the seams — per-window scales
+  were averaged in the merge). Stitched artifacts go to <seq_dir>/vis_stitched/.
+
+Examples:
+    # Interactive world view
+    python scripts/visualize_slam_offline.py --seq_dir example/video_0 --video_path example/video_0.mp4
+
+    # Headless render to <seq_dir>/vis_offline_<s>_<e>/aitviewer/video_0.mp4
+    python scripts/visualize_slam_offline.py --seq_dir example/tmp_4/3 --video_path <video> --headless
+"""
+import os
+import re
+import sys
+import math
+import argparse
+from collections import defaultdict
+from glob import glob
+
+sys.path.insert(0, os.path.dirname(__file__) + '/..')
+
+import joblib
+import numpy as np
+import torch
+
+from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
+from lib.eval_utils.custom_utils import load_slam_cam
+from lib.pipeline.frame_source import make_frame_source
+from lib.vis.run_vis2 import run_vis2_on_video
+
+CHUNK_NAME_RE = re.compile(r'^(\d+)_(\d+)$')
+
+
+class _FrameDims:
+    """Stand-in for a FrameSource when only frame dimensions are known.
+
+    World-space viz never reads pixels; run_vis2 only queries `frame_shape`.
+    """
+
+    def __init__(self, height, width):
+        self.frame_shape = (height, width)
+
+
+def mano_faces():
+    """Right/left face arrays incl. the wrist-closing faces, as in demo.py."""
+    faces = get_mano_faces()
+    faces_new = np.array([[92, 38, 234],
+                          [234, 38, 239],
+                          [38, 122, 239],
+                          [239, 122, 279],
+                          [122, 118, 279],
+                          [279, 118, 215],
+                          [118, 117, 215],
+                          [215, 117, 214],
+                          [117, 119, 214],
+                          [214, 119, 121],
+                          [119, 120, 121],
+                          [121, 120, 78],
+                          [120, 108, 78],
+                          [78, 108, 79]])
+    faces_right = np.concatenate([faces, faces_new], axis=0)
+    faces_left = faces_right[:, [0, 2, 1]]
+    return faces_left, faces_right
+
+
+def find_slam_npz(seq_dir, explicit=None):
+    if explicit:
+        path = explicit
+    else:
+        # Exact-name filter: SLAM/ may also hold `_disps_` and `_50fps` variants.
+        candidates = sorted(
+            p for p in glob(os.path.join(seq_dir, 'SLAM', 'hawor_slam_w_scale_*.npz'))
+            if re.search(r'hawor_slam_w_scale_(\d+)_(\d+)\.npz$', os.path.basename(p))
+        )
+        if not candidates:
+            raise SystemExit(f"No SLAM npz found under {os.path.join(seq_dir, 'SLAM')}")
+        if len(candidates) > 1:
+            listing = '\n  '.join(candidates)
+            raise SystemExit(f"Multiple SLAM files found; pick one with --slam_npz:\n  {listing}")
+        path = candidates[0]
+    m = re.search(r'hawor_slam_w_scale_(\d+)_(\d+)\.npz$', os.path.basename(path))
+    if not m:
+        raise SystemExit(f"Unexpected SLAM file name: {path}")
+    return path, int(m.group(1)), int(m.group(2))
+
+
+def list_cam_space_chunks(seq_dir):
+    """{tid: [(start, end_inclusive, json_path), ...]} from cam_space filenames."""
+    cam_space = os.path.join(seq_dir, 'cam_space')
+    if not os.path.isdir(cam_space):
+        raise SystemExit(f"cam_space folder not found: {cam_space}")
+    chunks_all = defaultdict(list)
+    for tid_name in sorted(os.listdir(cam_space)):
+        if not tid_name.isdigit():
+            continue
+        for cf in glob(os.path.join(cam_space, tid_name, '*.json')):
+            m = CHUNK_NAME_RE.match(os.path.splitext(os.path.basename(cf))[0])
+            if not m:
+                print(f"Skip chunk with unexpected name: {cf}")
+                continue
+            chunks_all[int(tid_name)].append((int(m.group(1)), int(m.group(2)), cf))
+        chunks_all[int(tid_name)].sort()
+    return chunks_all
+
+
+def stitch_slam_npz(seq_dir, slam_path):
+    """Make a merged SLAM trajectory continuous across window restarts.
+
+    The segmented merge concatenates per-window trajectories without alignment:
+    each window's DROID-SLAM run restarts at (near-)identity. Detect restarts
+    (a near-identity pose arriving via a discontinuous jump) and left-compose
+    each window with the rigid correction that makes its first pose continue
+    from the previous frame's pose (adjacent frames at target_fps are ~equal).
+    Seams are approximate: per-window scales were averaged in the merge.
+
+    Returns (slam_path, seq_dir) to use downstream. Unchanged when the
+    trajectory is already continuous; otherwise a stitched npz is written under
+    <seq_dir>/vis_stitched/SLAM/ (same filename, `disps` dropped) with
+    cam_space symlinked next to it so the infiller runs against stitched poses.
+    """
+    from hawor.utils.rotation import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion
+
+    data = dict(np.load(slam_path, allow_pickle=True))
+    traj = np.asarray(data['traj'], dtype=np.float32).copy()
+    t = torch.from_numpy(traj[:, :3])
+    q_wxyz = torch.from_numpy(traj[:, [6, 3, 4, 5]].copy())
+
+    # Restart = pose ~identity AND a jump from the previous frame far above the
+    # typical adjacent-frame motion (thresholds in unscaled SLAM units).
+    ang = 2.0 * torch.acos(q_wxyz[:, 0].abs().clamp(max=1.0))
+    near_identity = (t.norm(dim=1) < 0.05) & (ang < math.radians(2.0))
+    step = (t[1:] - t[:-1]).norm(dim=1)
+    jump_thresh = max(0.5, 20.0 * float(step.median()))
+    jump = torch.zeros(len(t), dtype=torch.bool)
+    jump[1:] = step > jump_thresh
+    boundaries = torch.where(near_identity & jump)[0].tolist()
+    if not boundaries:
+        print("Stitch: trajectory already continuous (no window restarts detected)")
+        return slam_path, seq_dir
+    print(f"Stitch: chaining {len(boundaries)} window restart(s) at frame(s) {boundaries}")
+
+    T4 = torch.eye(4).repeat(len(t), 1, 1)
+    T4[:, :3, :3] = quaternion_to_rotation_matrix(q_wxyz)
+    T4[:, :3, 3] = t
+    ends = boundaries[1:] + [len(t)]
+    for b, e in zip(boundaries, ends):
+        A = T4[b - 1] @ torch.linalg.inv(T4[b])
+        T4[b:e] = A @ T4[b:e]
+    traj[:, :3] = T4[:, :3, 3].numpy()
+    traj[:, 3:7] = rotation_matrix_to_quaternion(T4[:, :3, :3])[:, [1, 2, 3, 0]].numpy()
+
+    shadow = os.path.join(seq_dir, 'vis_stitched')
+    os.makedirs(os.path.join(shadow, 'SLAM'), exist_ok=True)
+    out_npz = os.path.join(shadow, 'SLAM', os.path.basename(slam_path))
+    out_data = {k: v for k, v in data.items() if k != 'disps'}
+    out_data['traj'] = traj
+    np.savez(out_npz, **out_data)
+    cam_link = os.path.join(shadow, 'cam_space')
+    if not os.path.exists(cam_link):
+        os.symlink(os.path.abspath(os.path.join(seq_dir, 'cam_space')), cam_link)
+    print(f"Stitch: saved {out_npz}")
+    return out_npz, shadow
+
+
+def load_or_build_world_res(args, seq_dir, start_idx, end_idx):
+    res_path = os.path.join(seq_dir, 'world_space_res.pth')
+    if os.path.exists(res_path):
+        print(f"Loading {res_path}")
+        return joblib.load(res_path)
+
+    if not args.video_path:
+        raise SystemExit(
+            f"{res_path} not found; rebuilding it runs the infiller, which needs "
+            "--video_path (frame count) and --infiller_weight."
+        )
+    print(f"{res_path} not found; running infiller from cam_space chunks ...")
+    # Heavy import (loads torch model code); keep it off the fast path.
+    from scripts.scripts_test_video.hawor_video import hawor_infiller
+    frame_chunks_all = defaultdict(list)
+    for tid, chunks in list_cam_space_chunks(seq_dir).items():
+        frame_chunks_all[tid] = [torch.arange(s, e + 1) for s, e, _ in chunks]
+    infill_args = argparse.Namespace(
+        video_path=args.video_path,
+        seq_dir=seq_dir,
+        infiller_weight=args.infiller_weight,
+        target_fps=args.target_fps,
+        frame_start=0,
+        frame_end=None,
+        input_type='file',
+    )
+    # Also saves world_space_res.pth into seq_dir as a side effect.
+    return hawor_infiller(infill_args, start_idx, end_idx, frame_chunks_all)
+
+
+def build_world_meshes(pred_trans, pred_rot, pred_hand_pose, pred_betas, vis_start, vis_end):
+    """MANO forward for both hands over [vis_start, vis_end); mirrors demo.py."""
+    faces_left, faces_right = mano_faces()
+    hand2idx = {"left": 0, "right": 1}
+
+    hand_idx = hand2idx['right']
+    pred_glob_r = run_mano(pred_trans[hand_idx:hand_idx + 1, vis_start:vis_end],
+                           pred_rot[hand_idx:hand_idx + 1, vis_start:vis_end],
+                           pred_hand_pose[hand_idx:hand_idx + 1, vis_start:vis_end],
+                           betas=pred_betas[hand_idx:hand_idx + 1, vis_start:vis_end])
+    right_dict = {
+        'vertices': pred_glob_r['vertices'][0].unsqueeze(0),
+        'faces': faces_right,
+    }
+
+    hand_idx = hand2idx['left']
+    pred_glob_l = run_mano_left(pred_trans[hand_idx:hand_idx + 1, vis_start:vis_end],
+                                pred_rot[hand_idx:hand_idx + 1, vis_start:vis_end],
+                                pred_hand_pose[hand_idx:hand_idx + 1, vis_start:vis_end],
+                                betas=pred_betas[hand_idx:hand_idx + 1, vis_start:vis_end])
+    left_dict = {
+        'vertices': pred_glob_l['vertices'][0].unsqueeze(0),
+        'faces': faces_left,
+    }
+    return left_dict, right_dict
+
+
+def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
+                       start_idx, max_points, z_max=10.0):
+    """Per-frame world-space point clouds from the SLAM keyframe depth maps.
+
+    `disps` exist per *keyframe*; each vis frame shows its nearest keyframe's
+    cloud, unprojected with that keyframe's (possibly stitched) pose — points
+    are static in the world while the camera moves. Metric depth = scale/disp.
+    Returns (F, max_points, 3) float32, or None if no disps are available.
+    """
+    data = np.load(slam_path)
+    if 'disps' not in data:
+        print(f"No disps in {slam_path}; skipping point cloud")
+        return None
+    disps = data['disps']                      # (K, h, w), SLAM (downscaled) res
+    tstamp = np.asarray(data['tstamp']).astype(np.int64)
+    scale = float(data['scale'])
+    fx = float(data['img_focal'])
+    cx, cy = np.asarray(data['img_center'], dtype=np.float64)
+    _, h, w = disps.shape
+    sx, sy = w / (2.0 * cx), h / (2.0 * cy)    # full-res -> disp-map intrinsics
+    fxd, fyd = fx * sx, fx * sy
+    cxd, cyd = cx * sx, cy * sy
+    uu, vv = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    uu, vv = uu.reshape(-1), vv.reshape(-1)
+
+    R_all = np.asarray(R_c2w_all, dtype=np.float64)
+    t_all = np.asarray(t_c2w_all, dtype=np.float64)
+    Rx = np.asarray(R_x, dtype=np.float64)
+    rng = np.random.default_rng(0)
+    cache = {}
+
+    def keyframe_cloud(k):
+        if k in cache:
+            return cache[k]
+        disp = disps[k].reshape(-1)
+        valid = np.flatnonzero(disp > max(1e-4, scale / z_max))  # z = scale/disp <= z_max
+        if valid.size == 0:
+            cloud = np.zeros((max_points, 3), dtype=np.float32)
+        else:
+            sel = rng.choice(valid, size=min(max_points, valid.size), replace=False)
+            if sel.size < max_points:
+                sel = np.concatenate([sel, rng.choice(valid, size=max_points - sel.size)])
+            z = scale / disp[sel]
+            pc = np.stack([(uu[sel] - cxd) / fxd * z, (vv[sel] - cyd) / fyd * z, z], axis=-1)
+            row = int(np.clip(tstamp[k] - start_idx, 0, len(R_all) - 1))
+            pw = pc @ R_all[row].T + t_all[row]
+            cloud = (pw @ Rx.T).astype(np.float32)
+        cache[k] = cloud
+        return cloud
+
+    F = vis_end - vis_start
+    points = np.zeros((F, max_points, 3), dtype=np.float32)
+    for i, t in enumerate(range(vis_start, vis_end)):
+        j = int(np.searchsorted(tstamp, t))
+        if j >= len(tstamp) or (j > 0 and t - tstamp[j - 1] <= tstamp[j] - t):
+            j -= 1
+        points[i] = keyframe_cloud(max(j, 0))
+    print(f"Point cloud: {len(cache)} keyframes used, {max_points} pts/frame "
+          f"({points.nbytes / 1e6:.0f} MB)")
+    return points
+
+
+def read_focal(seq_dir, slam_path):
+    """Focal in pixels, for the camera frustum shape."""
+    est_focal_path = os.path.join(seq_dir, 'est_focal.txt')
+    if os.path.exists(est_focal_path):
+        try:
+            return float(open(est_focal_path).read().strip())
+        except ValueError:
+            pass
+    data = np.load(slam_path)
+    if 'img_focal' in data:
+        return float(data['img_focal'])
+    return None
+
+
+def resolve_image_source(args, seq_dir, vis_start, vis_end):
+    """Only frame dimensions are needed for world viz; use whatever is at hand."""
+    if args.video_path:
+        fs = make_frame_source(args.video_path, target_fps=args.target_fps, color='rgb')
+        return fs[vis_start:vis_end]
+    img_dir = os.path.join(seq_dir, 'extracted_images')
+    imgfiles = sorted(glob(os.path.join(img_dir, '*.jpg'))) or sorted(glob(os.path.join(img_dir, '*.png')))
+    if imgfiles:
+        return imgfiles[vis_start:vis_end]
+    return _FrameDims(args.height, args.width)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize offline HaWoR results (SLAM camera + 3D hands, world space)")
+    parser.add_argument('--seq_dir', required=True, help='processed seq folder with cam_space/ and SLAM/')
+    parser.add_argument('--video_path', default=None,
+                        help='source video; needed for the infiller fallback (frame count)')
+    parser.add_argument('--slam_npz', default=None, help='explicit SLAM npz (needed if seq has multiple)')
+    parser.add_argument('--infiller_weight', default='./weights/hawor/checkpoints/infiller.pt')
+    parser.add_argument('--target_fps', type=float, default=30, help='fps the seq was processed at')
+    parser.add_argument('--headless', action='store_true', help='render an mp4 instead of opening the viewer window')
+    parser.add_argument('--show_traj', action='store_true', help='dotted hand trajectory trail')
+    parser.add_argument('--show_ghost', action='store_true', help='fading ghost hands')
+    parser.add_argument('--frustum_depth', type=float, default=0.2,
+                        help='camera frustum size (meters from optical center to image plane)')
+    parser.add_argument('--max_points', type=int, default=10000,
+                        help='points per frame for the SLAM depth point cloud (0 = off)')
+    parser.add_argument('--axes_length', type=float, default=0.3, help='world-origin axis triad length (meters)')
+    parser.add_argument('--vis_start', type=int, default=None, help='first frame to visualize (target_fps timeline)')
+    parser.add_argument('--vis_end', type=int, default=None, help='end frame (exclusive) to visualize')
+    parser.add_argument('--no_follow', action='store_true',
+                        help='start from the free viewer camera instead of the chase camera that '
+                             'follows the SLAM camera through the fixed world')
+    parser.add_argument('--follow_offset', default='0,0.4,1.2',
+                        help='chase-camera offset in the SLAM camera frame, "right,up,back" meters '
+                             '(default: 0.4 m above, 1.2 m behind; rotation follows the camera). '
+                             'Use "0,0,0" for the exact ego view.')
+    parser.add_argument('--center', action='store_true',
+                        help='translate the world so the first visualized camera pose sits at the '
+                             'origin (useful when SLAM drift pushed the sequence far away)')
+    parser.add_argument('--output_dir', default=None, help='default: <seq_dir>/vis_offline_<start>_<end>')
+    parser.add_argument('--width', type=int, default=1920, help='viewer size when no frames are available')
+    parser.add_argument('--height', type=int, default=1080, help='viewer size when no frames are available')
+    parser.add_argument('--window_type', default=None,
+                        help='aitviewer window backend override, e.g. glfw or pyglet '
+                             '(default: aitviewer config, usually Qt)')
+    args = parser.parse_args()
+
+    if args.window_type:
+        from aitviewer.configuration import CONFIG as _C
+        _C.update_conf({"window_type": args.window_type})
+
+    seq_dir = args.seq_dir
+    slam_path, start_idx, end_idx = find_slam_npz(seq_dir, args.slam_npz)
+    orig_slam_path = slam_path  # keeps disps (the stitched copy drops them)
+    # Always stitch: no-op for single-window results; for multi-window merges
+    # the world result must be built from the stitched poses.
+    slam_path, world_seq_dir = stitch_slam_npz(seq_dir, slam_path)
+    _, _, R_c2w_all, t_c2w_all = load_slam_cam(slam_path)
+
+    pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid = load_or_build_world_res(
+        args, world_seq_dir, start_idx, end_idx)
+
+    # Hand tensors live on the full video timeline; the SLAM traj covers
+    # [start_idx, start_idx + len(traj)). Visualize the overlap.
+    T = min(pred_trans.shape[1] - start_idx, R_c2w_all.shape[0])
+    if T <= 0:
+        raise SystemExit(f"No overlap between hand timeline ({pred_trans.shape[1]} frames) "
+                         f"and SLAM window starting at {start_idx}")
+    vis_start, vis_end = start_idx, start_idx + T
+    if args.vis_start is not None:
+        vis_start = max(vis_start, args.vis_start)
+    if args.vis_end is not None:
+        vis_end = min(vis_end, args.vis_end)
+    if vis_end <= vis_start:
+        raise SystemExit(f"Empty vis range [{vis_start}, {vis_end})")
+    print(f"vis {vis_start} to {vis_end}")
+
+    left_dict, right_dict = build_world_meshes(pred_trans, pred_rot, pred_hand_pose, pred_betas,
+                                               vis_start, vis_end)
+
+    # Map the SLAM camera frame to the viewer frame (same R_x flip as demo.py).
+    R_x = torch.tensor([[1, 0, 0],
+                        [0, -1, 0],
+                        [0, 0, -1]]).float()
+    cam_sl = slice(vis_start - start_idx, vis_end - start_idx)
+    R_c2w = torch.einsum('ij,njk->nik', R_x, R_c2w_all[cam_sl])
+    t_c2w = torch.einsum('ij,nj->ni', R_x, t_c2w_all[cam_sl])
+    left_dict['vertices'] = torch.einsum('ij,btnj->btni', R_x, left_dict['vertices'].cpu())
+    right_dict['vertices'] = torch.einsum('ij,btnj->btni', R_x, right_dict['vertices'].cpu())
+
+    # No further rotation: the SLAM world frame is the first camera pose, and
+    # after the R_x flip +Y is exactly the first frame's camera-up. The scene is
+    # therefore y-up by construction (up to how level the camera was at t=0).
+
+    points = None
+    if args.max_points > 0:
+        points = build_point_clouds(orig_slam_path, R_c2w_all, t_c2w_all, R_x,
+                                    vis_start, vis_end, start_idx, args.max_points)
+
+    if args.center:
+        # Rigid translation of the whole world; relative (metric) motion unchanged.
+        origin = t_c2w[0].clone()
+        t_c2w = t_c2w - origin
+        left_dict['vertices'] = left_dict['vertices'] - origin
+        right_dict['vertices'] = right_dict['vertices'] - origin
+        if points is not None:
+            points = points - np.asarray(origin, dtype=np.float32)
+        print(f"Centered world on first vis frame (offset {origin.tolist()})")
+
+    output_pth = args.output_dir or os.path.join(seq_dir, f"vis_offline_{vis_start}_{vis_end}")
+    os.makedirs(output_pth, exist_ok=True)
+    image_source = resolve_image_source(args, seq_dir, vis_start, vis_end)
+    img_focal = read_focal(seq_dir, slam_path)
+    out = run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_source,
+                            R_c2w=R_c2w, t_c2w=t_c2w,
+                            interactive=not args.headless,
+                            show_traj=args.show_traj, show_ghost=args.show_ghost,
+                            show_frustum=True, frustum_depth=args.frustum_depth,
+                            show_axes=True, axes_length=args.axes_length,
+                            show_ground=False, ground_up='y',
+                            follow_camera=not args.no_follow,
+                            follow_offset=tuple(float(x) for x in args.follow_offset.split(',')),
+                            points=points)
+    if args.headless and out:
+        print(f"Rendered {out}")
+    print("finish")
+
+
+if __name__ == '__main__':
+    main()
