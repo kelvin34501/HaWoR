@@ -32,18 +32,19 @@ import re
 import sys
 import math
 import argparse
+import faulthandler
 from collections import defaultdict
 from glob import glob
 
 sys.path.insert(0, os.path.dirname(__file__) + '/..')
 
+import cv2
 import joblib
 import numpy as np
 import torch
 
 from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
 from lib.eval_utils.custom_utils import load_slam_cam
-from lib.pipeline.frame_source import make_frame_source
 from lib.vis.run_vis2 import run_vis2_on_video
 
 CHUNK_NAME_RE = re.compile(r'^(\d+)_(\d+)$')
@@ -316,8 +317,18 @@ def read_focal(seq_dir, slam_path):
 def resolve_image_source(args, seq_dir, vis_start, vis_end):
     """Only frame dimensions are needed for world viz; use whatever is at hand."""
     if args.video_path:
-        fs = make_frame_source(args.video_path, target_fps=args.target_fps, color='rgb')
-        return fs[vis_start:vis_end]
+        # Probe dims via cv2 metadata only — a live decord reader in the same
+        # process as the aitviewer Qt/GL context segfaults (bundled-lib clash),
+        # and the world view never reads pixels anyway.
+        cap = cv2.VideoCapture(args.video_path)
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            cap.release()
+        if h > 0 and w > 0:
+            return _FrameDims(h, w)
+        return _FrameDims(args.height, args.width)
     img_dir = os.path.join(seq_dir, 'extracted_images')
     imgfiles = sorted(glob(os.path.join(img_dir, '*.jpg'))) or sorted(glob(os.path.join(img_dir, '*.png')))
     if imgfiles:
@@ -326,6 +337,7 @@ def resolve_image_source(args, seq_dir, vis_start, vis_end):
 
 
 def main():
+    faulthandler.enable()  # native crashes print a traceback, not a bare SIGSEGV
     parser = argparse.ArgumentParser(description="Visualize offline HaWoR results (SLAM camera + 3D hands, world space)")
     parser.add_argument('--seq_dir', required=True, help='processed seq folder with cam_space/ and SLAM/')
     parser.add_argument('--video_path', default=None,
