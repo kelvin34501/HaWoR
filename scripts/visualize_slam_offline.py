@@ -238,19 +238,38 @@ def build_world_meshes(pred_trans, pred_rot, pred_hand_pose, pred_betas, vis_sta
     return left_dict, right_dict
 
 
+def _depth_colormap(z, z_max):
+    """RGB in [0,1] for metric depths z via 'turbo' (matplotlib) or a numpy ramp."""
+    t = np.clip(np.asarray(z, dtype=np.float32) / max(z_max, 1e-6), 0.0, 1.0)
+    try:
+        import matplotlib.cm as _cm
+        return _cm.get_cmap('turbo')(t)[:, :3].astype(np.float32)
+    except Exception:
+        # Simple blue->green->red ramp (near=blue, far=red).
+        r = np.clip(1.5 - np.abs(4 * t - 3), 0, 1)
+        g = np.clip(1.5 - np.abs(4 * t - 2), 0, 1)
+        b = np.clip(1.5 - np.abs(4 * t - 1), 0, 1)
+        return np.stack([r, g, b], axis=-1).astype(np.float32)
+
+
 def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
-                       start_idx, max_points, z_max=10.0):
+                       start_idx, max_points, z_max=10.0, video_path=None,
+                       target_fps=30.0):
     """Per-frame world-space point clouds from the SLAM keyframe depth maps.
 
     `disps` exist per *keyframe*; each vis frame shows its nearest keyframe's
     cloud, unprojected with that keyframe's (possibly stitched) pose — points
     are static in the world while the camera moves. Metric depth = scale/disp.
-    Returns (F, max_points, 3) float32, or None if no disps are available.
+
+    Points are colored with the real image RGB sampled from ``video_path`` when
+    given (photometric), else by a depth colormap. Returns
+    (points, colors) with shapes (F, max_points, 3) and (F, max_points, 4)
+    float32, or (None, None) if no disps are available.
     """
     data = np.load(slam_path)
     if 'disps' not in data:
         print(f"No disps in {slam_path}; skipping point cloud")
-        return None
+        return None, None
     disps = data['disps']                      # (K, h, w), SLAM (downscaled) res
     tstamp = np.asarray(data['tstamp']).astype(np.int64)
     scale = float(data['scale'])
@@ -269,6 +288,31 @@ def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
     rng = np.random.default_rng(0)
     cache = {}
 
+    # Photometric color: decode the source video frame per keyframe via cv2 (no
+    # decord — a live decord reader in the viewer process segfaults). Map the
+    # keyframe's processed index to a native frame exactly like FrameSource.
+    cap = native_fps = n_native = None
+    if video_path:
+        cap = cv2.VideoCapture(video_path)
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or float(target_fps)
+        n_native = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if not cap.isOpened() or n_native <= 0:
+            print(f"Point cloud: could not open {video_path}; using depth colormap")
+            cap.release()
+            cap = None
+    photometric = cap is not None
+    ratio = (native_fps / float(target_fps)) if photometric else None
+
+    def sample_rgb(k, sel):
+        """Real image RGB in [0,1] for the selected disp pixels, or None."""
+        native = int(np.clip(math.floor(tstamp[k] * ratio + 1e-6), 0, n_native - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, native)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        frame = cv2.resize(frame, (w, h))[:, :, ::-1]   # BGR->RGB, disp-map res
+        return frame.reshape(-1, 3)[sel].astype(np.float32) / 255.0
+
     def keyframe_cloud(k):
         if k in cache:
             return cache[k]
@@ -276,6 +320,7 @@ def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
         valid = np.flatnonzero(disp > max(1e-4, scale / z_max))  # z = scale/disp <= z_max
         if valid.size == 0:
             cloud = np.zeros((max_points, 3), dtype=np.float32)
+            color = np.zeros((max_points, 4), dtype=np.float32)
         else:
             sel = rng.choice(valid, size=min(max_points, valid.size), replace=False)
             if sel.size < max_points:
@@ -285,19 +330,27 @@ def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
             row = int(np.clip(tstamp[k] - start_idx, 0, len(R_all) - 1))
             pw = pc @ R_all[row].T + t_all[row]
             cloud = (pw @ Rx.T).astype(np.float32)
-        cache[k] = cloud
-        return cloud
+            rgb = sample_rgb(k, sel) if photometric else None
+            if rgb is None:                       # colormap (fallback or no video)
+                rgb = _depth_colormap(z, z_max)
+            color = np.concatenate([rgb, np.ones((len(rgb), 1), np.float32)], axis=1)
+        cache[k] = (cloud, color)
+        return cache[k]
 
     F = vis_end - vis_start
     points = np.zeros((F, max_points, 3), dtype=np.float32)
+    colors = np.zeros((F, max_points, 4), dtype=np.float32)
     for i, t in enumerate(range(vis_start, vis_end)):
         j = int(np.searchsorted(tstamp, t))
         if j >= len(tstamp) or (j > 0 and t - tstamp[j - 1] <= tstamp[j] - t):
             j -= 1
-        points[i] = keyframe_cloud(max(j, 0))
+        points[i], colors[i] = keyframe_cloud(max(j, 0))
+    if cap is not None:
+        cap.release()
     print(f"Point cloud: {len(cache)} keyframes used, {max_points} pts/frame "
-          f"({points.nbytes / 1e6:.0f} MB)")
-    return points
+          f"({points.nbytes / 1e6:.0f} MB), color="
+          f"{'photometric' if photometric else 'colormap'}")
+    return points, colors
 
 
 def read_focal(seq_dir, slam_path):
@@ -350,8 +403,10 @@ def main():
     parser.add_argument('--show_ghost', action='store_true', help='fading ghost hands')
     parser.add_argument('--frustum_depth', type=float, default=0.2,
                         help='camera frustum size (meters from optical center to image plane)')
-    parser.add_argument('--max_points', type=int, default=10000,
+    parser.add_argument('--max_points', type=int, default=20000,
                         help='points per frame for the SLAM depth point cloud (0 = off)')
+    parser.add_argument('--point_size', type=float, default=8.0,
+                        help='SLAM depth point cloud dot size in pixels (larger = easier to see up close)')
     parser.add_argument('--axes_length', type=float, default=0.3, help='world-origin axis triad length (meters)')
     parser.add_argument('--vis_start', type=int, default=None, help='first frame to visualize (target_fps timeline)')
     parser.add_argument('--vis_end', type=int, default=None, help='end frame (exclusive) to visualize')
@@ -420,10 +475,12 @@ def main():
     # after the R_x flip +Y is exactly the first frame's camera-up. The scene is
     # therefore y-up by construction (up to how level the camera was at t=0).
 
-    points = None
+    points = point_colors = None
     if args.max_points > 0:
-        points = build_point_clouds(orig_slam_path, R_c2w_all, t_c2w_all, R_x,
-                                    vis_start, vis_end, start_idx, args.max_points)
+        points, point_colors = build_point_clouds(
+            orig_slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
+            start_idx, args.max_points, video_path=args.video_path,
+            target_fps=args.target_fps)
 
     if args.center:
         # Rigid translation of the whole world; relative (metric) motion unchanged.
@@ -448,7 +505,8 @@ def main():
                             show_ground=False, ground_up='y',
                             follow_camera=not args.no_follow,
                             follow_offset=tuple(float(x) for x in args.follow_offset.split(',')),
-                            points=points)
+                            points=points, point_colors=point_colors,
+                            point_size=args.point_size)
     if args.headless and out:
         print(f"Rendered {out}")
     print("finish")

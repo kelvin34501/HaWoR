@@ -176,6 +176,8 @@ def run_vis2_on_video(res_dict,
                       follow_camera=False,
                       follow_offset=(0.0, 0.4, 1.2),
                       points=None,
+                      point_colors=None,
+                      point_size=8.0,
                       ghost_stride=35,
                       ghost_count=4,
                       ghost_alpha_decay=0.1,
@@ -395,11 +397,8 @@ def run_vis2_on_video(res_dict,
         # (F, N, 3) per-frame SLAM depth point cloud; any renderable works in
         # the meshes dict (render_seq just scene.add()s them).
         from aitviewer.renderables.point_clouds import PointClouds
-        pc = PointClouds(points, color=(0.62, 0.62, 0.68, 1.0), name="slam_points")
-        try:
-            pc.point_size = 2.0
-        except Exception:
-            pass
+        pc = PointClouds(points, colors=point_colors, point_size=point_size,
+                         color=(0.62, 0.62, 0.68, 1.0), name="slam_points")
         meshes["slam_points"] = pc
 
     vis_h, vis_w = (height, width)
