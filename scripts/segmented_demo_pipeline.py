@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Segment -> demo.py -> merge cam_space chunk results.
+"""Segment -> demo.py -> merge chunk results.
 
 This script is designed for long videos that are expensive to process in one pass.
 It runs demo.py over consecutive frame-index windows of the input video (decoded on
 demand via FrameSource — no chunk files, no JPEG dump) and merges per-frame
-camera-space parameters back into a single timeline.
+camera-space parameters plus SLAM/disparity artifacts back into a single
+timeline.
 
 Notes
-- It merges camera-space params only (init_root_orient/init_hand_pose/init_trans/init_betas).
-- No world-space alignment is performed.
+- It merges camera-space params (init_root_orient/init_hand_pose/init_trans/init_betas)
+  and the per-window SLAM/disparity artifacts.
+- No world-space hand result is built here.
 - Each window is processed in its own seq dir (work_dir/chunk_NNNNNN); the global
   frame offset is the window start index.
 """
@@ -644,7 +646,7 @@ def collect_videos(args: argparse.Namespace) -> List[str]:
 
 
 def make_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Segment video(s), run demo.py per chunk, merge cam_space params")
+    p = argparse.ArgumentParser(description="Segment video(s), run demo.py per chunk, merge chunk outputs")
 
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--video_path", type=str, help="Single input video path")

@@ -1,6 +1,6 @@
 # HaWoR Folder Annotation Service
 
-This service adds folder-level batch annotation on top of the existing single-video HaWoR pipeline. It mounts one object-storage bucket per request on demand, scans one bucket-relative `input_subdir`, creates one job, dispatches videos across the configured GPU pool, writes intermediate small files into `cache_dir`, writes final outputs to `output_subdir/<video_stem>/` inside the bucket, and unmounts the bucket when the job finishes.
+This service adds folder-level batch annotation on top of the existing single-video HaWoR pipeline. It mounts the bucket/prefix from `input_url` per request on demand, scans the top level of that mounted prefix, creates one job, dispatches videos across the configured GPU pool, writes intermediate files into `cache_dir`, writes final outputs to `annotations/<video_stem>/` under the input prefix, and unmounts when the job finishes.
 
 ## Install
 
@@ -24,6 +24,7 @@ Or environment variables:
 ```bash
 export HAWOR_CACHE_DIR=./example/data_nvme/hawor_process
 export HAWOR_GPU_IDS=0,1
+export HAWOR_JOBS_PER_GPU=1
 export HAWOR_CLEANUP_INTERMEDIATE=true
 export HAWOR_CLEANUP_FAILED_CACHE=false
 export HAWOR_COPY_EXTRACTED_IMAGES=false
@@ -37,6 +38,8 @@ Common startup options:
 
 - `--cache-dir`: high-throughput local scratch directory used for chunking and temporary outputs.
 - `--gpu-ids`: GPU pool definition such as `0` or `0,1`.
+- `--max-workers`: maximum worker threads used to dispatch videos. Actual concurrent processing is capped by `len(gpu_ids) * HAWOR_JOBS_PER_GPU`.
+- `HAWOR_JOBS_PER_GPU`: env-only concurrency multiplier per GPU (default `1`).
 - `--cleanup-intermediate` / `--no-cleanup-intermediate`: control whether successful job cache directories are deleted.
 - `--cleanup-failed-cache`: delete failed job cache directories instead of preserving them for debugging.
 - `--copy-extracted-images` / `--no-copy-extracted-images`: **deprecated no-op.** Frames are now decoded on demand from the video (`FrameSource`) and are never written to disk, so there are no `extracted_images`/`extracted_images_50fps` directories to copy. The flag (and `HAWOR_COPY_EXTRACTED_IMAGES`) is still accepted but has no effect.
@@ -46,12 +49,12 @@ Common startup options:
 
 The service mounts one object-storage bucket per job on demand:
 
-- Each `POST /v1/annotate` carries the bucket connection details (bucket, endpoint, ak/sk, optional prefix/region/flags).
-- The bucket is mounted at `<mount-root>/<job_id>/` using `s3mount`, the job runs against bucket-relative paths, and the mount is removed when the job reaches a terminal state.
-- `input_subdir` / `output_subdir` are bucket-relative; they are resolved inside the per-job mount and may not escape it.
-- Access/secret keys are written to a private `0600` credentials file for the `s3mount` child process only; they are never logged or echoed back.
+- Each `POST /v1/annotate` carries `input_url` (`s3://bucket/prefix`) plus endpoint, access/secret keys, optional region, and mount flags.
+- The requested bucket/prefix is mounted at `<mount-root>/<job_id>/video_in` using `s3mount`, and the mount is removed when the job reaches a terminal state.
+- The service scans the mounted input prefix itself and writes results to the fixed `annotations/` directory inside that same prefix.
+- Access/secret keys are passed only to the `s3mount` child process environment; they are never logged or echoed back.
 - A bucket already in use by another active job is rejected with `409`.
-- Native `s3://...` paths are rejected in this version.
+- Native `s3://...` filesystem paths are not used internally; the public API accepts `s3://...` only through `input_url`.
 
 ## API
 
@@ -63,18 +66,16 @@ The service mounts one object-storage bucket per job on demand:
 curl -X POST http://127.0.0.1:8000/v1/annotate \
   -H 'Content-Type: application/json' \
   -d '{
-    "bucket": "my-bucket",
+    "input_url": "s3://my-bucket/datasets/batch_01",
     "endpoint": "http://10.140.2.254:80",
     "access_key": "<AK>",
     "secret_key": "<SK>",
-    "input_subdir": "datasets/batch_01",
-    "output_subdir": "annotations/batch_01",
-    "prefix": null,
     "region": null,
     "force_path_style": false,
     "use_listobject_v2": false,
     "vis_mode": "off",
-    "overwrite": false
+    "overwrite": false,
+    "skip_processed": false
   }'
 ```
 
@@ -98,19 +99,19 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`, and
 
 ## Current Behavior
 
-- Only scans the top level of `input_subdir`; no recursive scan.
-- `output_subdir` is optional. When omitted, the service uses `<input_subdir>_output` inside the same bucket.
-- The request supports the bucket connection block, `input_subdir`, `output_subdir`, `vis_mode`, and `overwrite`.
+- Only scans the top level of the `input_url` prefix; no recursive scan.
+- Outputs always go to `annotations/<video_stem>/` under the same mounted input prefix.
+- The request supports `input_url`, `endpoint`, access/secret keys, `region`, `force_path_style`, `use_listobject_v2`, `vis_mode`, `overwrite`, and `skip_processed`.
 - `img_focal` is not exposed in this version.
-- Status values are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, and `CANCELED`.
+- Status values are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED`, and item-level `SKIPPED`.
 - `progress` is reported as an integer percentage from `0` to `100`.
-- Progress fields include `videos_total`, `videos_done`, `videos_failed`, `progress`, and the job-level `stage` field.
+- Progress fields include `videos_total`, `videos_done`, `videos_failed`, `videos_skipped`, `progress`, and the job-level `stage` field.
 - Intermediate cache is organized under `<cache_dir>/<job_id>/<video_stem>/`.
 - Successful jobs clean cache by default; failed or canceled jobs are kept by default for debugging.
 - Environment variables use the same semantics as the service config: `HAWOR_CLEANUP_INTERMEDIATE` and `HAWOR_CLEANUP_FAILED_CACHE`.
-- One bucket per job: `input_subdir` and `output_subdir` both resolve inside the same mounted bucket.
+- One bucket/prefix per job: input videos and `annotations/` outputs both live inside the same mounted prefix.
 - The bucket is mounted before the job starts and unmounted when the job finishes; a bucket in use by another active job is rejected.
-- Native `s3://` and `petrel-oss` access are not implemented.
+- `skip_processed=true` skips videos whose result directory already contains `process.done`.
 - Empty directories, directories without supported video files, subpaths that escape the mount, and existing result directories with `overwrite=false` are rejected before dispatch.
 
-Each completed video is written to `output_dir/<video_stem>/`. The directory contains `cam_space/`, `SLAM/`, `process.log`, and — when post-processing is enabled — `cam_space_50fps/` plus the interpolated 50fps SLAM artifacts. Visualization outputs are saved with the rendered FPS in the filename, for example `cam_space_visualization_50fps.mp4` / `world_space_visualization_50fps.mp4` when interpolation is available, or `cam_space_visualization_30fps.mp4` / `world_space_visualization_30fps.mp4` on the base timeline. Frames are decoded on demand and are **not** written to disk, so there are no `extracted_images*` directories.
+Each completed video is written to `annotations/<video_stem>/` under the mounted input prefix. The directory contains `cam_space/`, `SLAM/`, `process.log`, `process.done`, and — when post-processing is enabled — `cam_space_50fps/` plus the interpolated 50fps SLAM artifacts. Visualization outputs are saved with the rendered FPS in the filename, for example `cam_space_visualization_50fps.mp4` / `world_space_visualization_50fps.mp4` when interpolation is available, or `cam_space_visualization_30fps.mp4` / `world_space_visualization_30fps.mp4` on the base timeline. Frames are decoded on demand and are **not** written to disk, so there are no `extracted_images*` directories.

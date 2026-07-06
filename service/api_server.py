@@ -22,7 +22,7 @@ class AnnotateRequest(BaseModel):
     access_key: str = Field(..., description="Access key id (sensitive, never logged)")
     secret_key: str = Field(..., description="Secret access key (sensitive, never logged)")
     region: Optional[str] = Field(default=None, description="Optional region (e.g. oss-cn-beijing)")
-    force_path_style: bool = Field(default=False, description="Set for domain-style endpoints")
+    force_path_style: bool = Field(default=False, description="Set for endpoints requiring path-style S3 requests")
     use_listobject_v2: bool = Field(default=False, description="Set for backends requiring ListObjectsV2")
     vis_mode: str = Field(default="off", description="off | cam | world")
     overwrite: bool = Field(default=False, description="Overwrite existing per-video outputs")

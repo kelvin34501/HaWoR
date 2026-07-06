@@ -1,8 +1,8 @@
 """On-demand s3mount management for the HaWoR annotation service.
 
-Each annotation job mounts exactly one object-storage bucket at a per-job
-directory ``<mount_root>/<job_id>/`` using the ``s3mount`` binary, runs against
-bucket-relative paths, and unmounts when the job reaches a terminal state.
+Each annotation job mounts exactly one object-storage bucket or bucket prefix at
+``<mount_root>/<job_id>/video_in`` using the ``s3mount`` binary, runs against
+that mounted directory, and unmounts when the job reaches a terminal state.
 
 Security notes:
 - Access/secret keys are passed to the s3mount child process through the
