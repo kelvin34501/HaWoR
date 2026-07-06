@@ -4,54 +4,47 @@ Runs purely from a processed seq folder (no detection/tracking/SLAM rerun):
 
     <seq_dir>/cam_space/<tid>/<start>_<end>.json   raw camera-space MANO chunks
     <seq_dir>/SLAM/hawor_slam_w_scale_<s>_<e>.npz  scaled camera trajectory
-    <seq_dir>/world_space_res.pth                  (optional) infilled world-space result
+    <seq_dir>/world_space_res.pth                  infilled world-space result
 
 Renders an aitviewer scene (y-up = first-frame camera up) with both hand
 meshes, a wireframe camera frustum, and a world-axis triad. By default the
 view is follow-cam: the SLAM camera is pinned at the scene center each frame
 and the hands move relative to it (--no_follow for the absolute world frame).
 
-- If world_space_res.pth is missing, the motion infiller is run offline: the
-  chunk frame ranges are recovered from the cam_space filenames, so only the
-  infiller checkpoint and the source video (for the frame count) are needed.
-  The rebuilt world_space_res.pth is saved back for next time.
+- This script is read-only. If world_space_res.pth is missing, run
+  scripts/build_world_space_res.py first.
 - Merged segmented trajectories are stitched automatically when the merged
   SLAM file records interior `window_starts`. If the merge already aligned
   windows through overlap frames, or the result is single-window, the stitch
   step logs that branch and uses the original trajectory unchanged. Stitched
-  artifacts go to <seq_dir>/vis_stitched/.
+  trajectories are kept in memory and are not written to disk.
 
 Examples:
     # Interactive world view
     python scripts/visualize_slam_offline.py --seq_dir example/video_0 --video_path example/video_0.mp4
 
-    # Headless render to <seq_dir>/vis_offline_<s>_<e>/aitviewer/video_0.mp4
-    python scripts/visualize_slam_offline.py --seq_dir example/tmp_4/3 --video_path <video> --headless
+    # Interactive world view with source-video point-cloud colors
+    python scripts/visualize_slam_offline.py --seq_dir example/tmp_4/3 --video_path <video>
 """
 import os
-import re
 import sys
 import math
 import argparse
 import faulthandler
-from collections import defaultdict
 from glob import glob
 
 sys.path.insert(0, os.path.dirname(__file__) + '/..')
 
 import cv2
-import joblib
 import numpy as np
 import torch
 
 from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
-from lib.eval_utils.custom_utils import load_slam_cam
+from lib.eval_utils.custom_utils import quaternion_to_matrix
 from lib.vis.run_vis2 import run_vis2_on_video
 from scripts.slam_world_utils import (
-    CHUNK_NAME_RE,
     find_slam_npz,
-    list_cam_space_chunks,
-    stitch_slam_npz,
+    stitch_slam_data,
     load_or_build_world_res,
 )
 
@@ -230,6 +223,18 @@ def build_point_clouds(slam_path, R_c2w_all, t_c2w_all, R_x, vis_start, vis_end,
     return points, colors
 
 
+def load_slam_cam_data(pred_cam):
+    """load_slam_cam equivalent for an in-memory SLAM npz dict."""
+    pred_traj = pred_cam['traj']
+    scale = float(np.asarray(pred_cam['scale']).reshape(-1)[0])
+    t_c2w_sla = torch.tensor(pred_traj[:, :3]) * scale
+    pred_camq = torch.tensor(pred_traj[:, 3:])
+    R_c2w_sla = quaternion_to_matrix(pred_camq[:, [3, 0, 1, 2]])
+    R_w2c_sla = R_c2w_sla.transpose(-1, -2)
+    t_w2c_sla = -torch.einsum("bij,bj->bi", R_w2c_sla, t_c2w_sla)
+    return R_w2c_sla, t_w2c_sla, R_c2w_sla, t_c2w_sla
+
+
 def read_focal(seq_dir, slam_path):
     """Focal in pixels, for the camera frustum shape."""
     est_focal_path = os.path.join(seq_dir, 'est_focal.txt')
@@ -275,7 +280,8 @@ def main():
     parser.add_argument('--slam_npz', default=None, help='explicit SLAM npz (needed if seq has multiple)')
     parser.add_argument('--infiller_weight', default='./weights/hawor/checkpoints/infiller.pt')
     parser.add_argument('--target_fps', type=float, default=30, help='fps the seq was processed at')
-    parser.add_argument('--headless', action='store_true', help='render an mp4 instead of opening the viewer window')
+    parser.add_argument('--headless', action='store_true',
+                        help='disabled: this read-only viewer does not render files')
     parser.add_argument('--show_traj', action='store_true', help='dotted hand trajectory trail')
     parser.add_argument('--show_ghost', action='store_true', help='fading ghost hands')
     parser.add_argument('--frustum_depth', type=float, default=0.2,
@@ -297,7 +303,8 @@ def main():
     parser.add_argument('--center', action='store_true',
                         help='translate the world so the first visualized camera pose sits at the '
                              'origin (useful when SLAM drift pushed the sequence far away)')
-    parser.add_argument('--output_dir', default=None, help='default: <seq_dir>/vis_offline_<start>_<end>')
+    parser.add_argument('--output_dir', default=None,
+                        help='kept for CLI compatibility; ignored in read-only interactive mode')
     parser.add_argument('--width', type=int, default=1920, help='viewer size when no frames are available')
     parser.add_argument('--height', type=int, default=1080, help='viewer size when no frames are available')
     parser.add_argument('--window_type', default=None,
@@ -308,17 +315,23 @@ def main():
     if args.window_type:
         from aitviewer.configuration import CONFIG as _C
         _C.update_conf({"window_type": args.window_type})
+    if args.headless:
+        raise SystemExit(
+            "--headless would render a video file; visualize_slam_offline.py is read-only. "
+            "Use lib/vis/run_vis2.py callers or a dedicated render script for exports."
+        )
 
     seq_dir = args.seq_dir
     slam_path, start_idx, end_idx = find_slam_npz(seq_dir, args.slam_npz)
     orig_slam_path = slam_path  # keeps disps (the stitched copy drops them)
-    # Always stitch: no-op for single-window results; for multi-window merges
-    # the world result must be built from the stitched poses.
-    slam_path, world_seq_dir = stitch_slam_npz(seq_dir, slam_path)
-    _, _, R_c2w_all, t_c2w_all = load_slam_cam(slam_path)
+    # Always stitch in memory: no-op for single-window results; for multi-window
+    # merges the visualized camera poses must be continuous, but this script must
+    # not create the old vis_stitched/ cache.
+    slam_data, _ = stitch_slam_data(slam_path)
+    _, _, R_c2w_all, t_c2w_all = load_slam_cam_data(slam_data)
 
     pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid = load_or_build_world_res(
-        args, world_seq_dir, start_idx, end_idx)
+        args, seq_dir, start_idx, end_idx, allow_build=False)
 
     # Hand tensors live on the full video timeline; the SLAM traj covers
     # [start_idx, start_idx + len(traj)). Visualize the overlap.
@@ -369,23 +382,20 @@ def main():
             points = points - np.asarray(origin, dtype=np.float32)
         print(f"Centered world on first vis frame (offset {origin.tolist()})")
 
-    output_pth = args.output_dir or os.path.join(seq_dir, f"vis_offline_{vis_start}_{vis_end}")
-    os.makedirs(output_pth, exist_ok=True)
+    output_pth = args.output_dir or seq_dir
     image_source = resolve_image_source(args, seq_dir, vis_start, vis_end)
     img_focal = read_focal(seq_dir, slam_path)
-    out = run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_source,
-                            R_c2w=R_c2w, t_c2w=t_c2w,
-                            interactive=not args.headless,
-                            show_traj=args.show_traj, show_ghost=args.show_ghost,
-                            show_frustum=True, frustum_depth=args.frustum_depth,
-                            show_axes=True, axes_length=args.axes_length,
-                            show_ground=False, ground_up='y',
-                            follow_camera=not args.no_follow,
-                            follow_offset=tuple(float(x) for x in args.follow_offset.split(',')),
-                            points=points, point_colors=point_colors,
-                            point_size=args.point_size)
-    if args.headless and out:
-        print(f"Rendered {out}")
+    run_vis2_on_video(left_dict, right_dict, output_pth, img_focal, image_source,
+                      R_c2w=R_c2w, t_c2w=t_c2w,
+                      interactive=not args.headless,
+                      show_traj=args.show_traj, show_ghost=args.show_ghost,
+                      show_frustum=True, frustum_depth=args.frustum_depth,
+                      show_axes=True, axes_length=args.axes_length,
+                      show_ground=False, ground_up='y',
+                      follow_camera=not args.no_follow,
+                      follow_offset=tuple(float(x) for x in args.follow_offset.split(',')),
+                      points=points, point_colors=point_colors,
+                      point_size=args.point_size)
     print("finish")
 
 

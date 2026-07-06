@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,8 @@ class HaWoRProcessResult:
     extracted_images_50fps_dir: Optional[Path]
     world_space_res_path: Optional[Path]
     world_space_res_50fps_path: Optional[Path]
+    cam_space_vis_path: Optional[Path]
+    world_space_vis_path: Optional[Path]
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,7 @@ class HaWoRProcessorConfig:
     # timeline to produce a world-space result (world_space_res.pth).
     run_world_space: bool = True
     infiller_weight: str = "./weights/hawor/checkpoints/infiller.pt"
+    run_visualizations: bool = True
     # Frames are decoded on demand from the video; nothing is extracted to disk, so
     # this flag is accepted for API compatibility but has no effect.
     copy_extracted_images: bool = True
@@ -126,8 +130,6 @@ class HaWoRVideoProcessorForService:
         if not video.is_file():
             raise FileNotFoundError(f"Video file not found: {video}")
 
-        scratch_root.mkdir(parents=True, exist_ok=True)
-
         work_dir = scratch_root / "_segmented_work"
         staged_output_dir = scratch_root / "_final_output"
         # The live log is append-written and used as subprocess stdout, which is
@@ -137,12 +139,16 @@ class HaWoRVideoProcessorForService:
         log_path = out_dir / "process.log"
         if overwrite_output and clear_on_overwrite:
             self._clear_known_outputs(out_dir, scratch_root, log_path)
+        else:
+            self._clear_scratch_outputs(scratch_root)
 
         with self.gpu_pool.acquire() as gpu_id:
             env = self._build_env(gpu_id)
             try:
                 self._run_segmented_pipeline(video, work_dir, live_log_path, gpu_id, env)
                 self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
+                if self.config.cleanup_intermediate and work_dir.exists():
+                    shutil.rmtree(work_dir)
 
                 # Stitch merged SLAM + infill the full sequence -> world_space_res.pth.
                 # Runs on the staged dir before interpolation so it flows to out_dir
@@ -155,6 +161,17 @@ class HaWoRVideoProcessorForService:
                 extracted_images_50fps_dir: Optional[Path] = None
                 if self.config.run_post_steps or self.config.force_interpolate:
                     self._run_interpolation(staged_output_dir, video, live_log_path, env)
+
+                world_space_vis_path: Optional[Path] = None
+                if self.config.run_visualizations:
+                    self._run_cam_space_visualization(staged_output_dir, video, live_log_path, env)
+                    if self.config.run_world_space:
+                        staged_world_space_vis_path = self._run_world_space_visualization(
+                            staged_output_dir, video, live_log_path, env)
+                        world_space_vis_path = out_dir / staged_world_space_vis_path.name
+
+                if not self.config.cleanup_intermediate:
+                    self._copy_tree_data_only(work_dir, staged_output_dir / "_segmented_work")
 
                 out_dir.mkdir(parents=True, exist_ok=True)
                 self._copy_directory_contents(staged_output_dir,
@@ -182,6 +199,9 @@ class HaWoRVideoProcessorForService:
                                       if self.config.run_world_space else None),
                 world_space_res_50fps_path=(out_dir / "world_space_res_50fps.pth"
                                             if self.config.run_world_space else None),
+                cam_space_vis_path=(out_dir / "cam_space_visualization.mp4"
+                                    if self.config.run_visualizations else None),
+                world_space_vis_path=world_space_vis_path,
             )
 
     def _validate_config(self) -> None:
@@ -292,16 +312,20 @@ class HaWoRVideoProcessorForService:
         except OSError:
             pass
 
-    def _clear_known_outputs(self, output_dir: Path, scratch_root: Path, log_path: Path) -> None:
-        # Clear local scratch unconditionally; this also removes any live log inside it.
+    def _clear_scratch_outputs(self, scratch_root: Path) -> None:
+        """Clear local per-video scratch, including staged final output."""
         if scratch_root.exists():
             shutil.rmtree(scratch_root)
         scratch_root.mkdir(parents=True, exist_ok=True)
+
+    def _clear_known_outputs(self, output_dir: Path, scratch_root: Path, log_path: Path) -> None:
+        self._clear_scratch_outputs(scratch_root)
 
         # Best-effort removal of previous out_dir artifacts. Silently skips paths
         # that cannot be deleted (e.g. s3mount targets without --allow-delete).
         out_paths = [
             log_path,
+            output_dir / PROCESS_DONE_FILENAME,
             output_dir / "cam_space",
             output_dir / "cam_space_50fps",
             output_dir / "SLAM",
@@ -309,6 +333,10 @@ class HaWoRVideoProcessorForService:
             output_dir / "extracted_images_50fps",
             output_dir / "world_space_res.pth",
             output_dir / "world_space_res_50fps.pth",
+            output_dir / "cam_space_visualization.mp4",
+            output_dir / "world_space_visualization.mp4",
+            output_dir / "world_space_visualization_50fps.mp4",
+            output_dir / "_segmented_work",
         ]
         for path in out_paths:
             if not path.exists():
@@ -360,6 +388,86 @@ class HaWoRVideoProcessorForService:
             str(self.config.target_fps),
         ]
         self._run_command(cmd, log_path, env)
+
+    def _run_cam_space_visualization(
+        self,
+        seq_dir: Path,
+        video: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "visualize_reconstructed_video.py"
+        cam_space_dir = seq_dir / "cam_space_50fps"
+        fps = self.config.interp_target_fps
+        if not cam_space_dir.is_dir():
+            cam_space_dir = seq_dir / "cam_space"
+            fps = self.config.target_fps
+        cmd = [
+            sys.executable,
+            str(script),
+            "--video_path",
+            str(video),
+            "--cam_space_dir",
+            str(cam_space_dir),
+            "--output",
+            str(seq_dir / "cam_space_visualization.mp4"),
+            "--fps",
+            str(int(round(fps))),
+        ]
+        self._run_command(cmd, log_path, env)
+
+    def _run_world_space_visualization(
+        self,
+        seq_dir: Path,
+        video: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> Path:
+        script = self.config.project_dir / "scripts" / "visualize_world_reconstructed_video.py"
+        world_space_res = seq_dir / "world_space_res_50fps.pth"
+        output_path = seq_dir / "world_space_visualization_50fps.mp4"
+        fps = self.config.interp_target_fps
+        slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=True)
+        if not world_space_res.is_file():
+            world_space_res = seq_dir / "world_space_res.pth"
+            output_path = seq_dir / "world_space_visualization.mp4"
+            fps = self.config.target_fps
+            slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
+        cmd = [
+            sys.executable,
+            str(script),
+            "--video_path",
+            str(video),
+            "--seq_dir",
+            str(seq_dir),
+            "--world_space_res",
+            str(world_space_res),
+            "--slam_npz",
+            str(slam_npz),
+            "--output",
+            str(output_path),
+            "--fps",
+            str(int(round(fps))),
+        ]
+        self._run_command(cmd, log_path, env)
+        return output_path
+
+    def _find_visualization_slam_npz(self, seq_dir: Path, *, prefer_50fps: bool) -> Path:
+        slam_dir = seq_dir / "SLAM"
+        suffix = "_50fps" if prefer_50fps else ""
+        pattern = re.compile(rf"^hawor_slam_w_scale_\d+_\d+{suffix}\.npz$")
+        candidates = sorted(
+            path for path in slam_dir.glob("hawor_slam_w_scale_*.npz")
+            if pattern.match(path.name) and "_disps_" not in path.name
+        )
+        if not candidates and prefer_50fps:
+            return self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
+        if not candidates:
+            raise FileNotFoundError(f"No matching SLAM npz found under {slam_dir}")
+        if len(candidates) > 1:
+            listing = "\n  ".join(str(path) for path in candidates)
+            raise RuntimeError(f"Multiple SLAM npz files found for visualization:\n  {listing}")
+        return candidates[0]
 
     def _run_interpolation(
         self,

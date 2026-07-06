@@ -22,6 +22,9 @@ import torch
 CHUNK_NAME_RE = re.compile(r'^(\d+)_(\d+)$')
 
 
+SLAM_NAME_RE = re.compile(r'hawor_slam_w_scale_(\d+)_(\d+)(?:_50fps)?\.npz$')
+
+
 def find_slam_npz(seq_dir, explicit=None):
     if explicit:
         path = explicit
@@ -37,7 +40,7 @@ def find_slam_npz(seq_dir, explicit=None):
             listing = '\n  '.join(candidates)
             raise SystemExit(f"Multiple SLAM files found; pick one with --slam_npz:\n  {listing}")
         path = candidates[0]
-    m = re.search(r'hawor_slam_w_scale_(\d+)_(\d+)\.npz$', os.path.basename(path))
+    m = SLAM_NAME_RE.search(os.path.basename(path))
     if not m:
         raise SystemExit(f"Unexpected SLAM file name: {path}")
     return path, int(m.group(1)), int(m.group(2))
@@ -62,6 +65,49 @@ def list_cam_space_chunks(seq_dir):
     return chunks_all
 
 
+def stitch_slam_data(slam_path):
+    """Return SLAM npz data with metadata stitching applied in memory."""
+    from hawor.utils.rotation import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion
+
+    data = dict(np.load(slam_path, allow_pickle=True))
+    if bool(np.asarray(data.get('overlap_aligned', False)).reshape(-1)[0]):
+        print("Stitch: branch=overlap_aligned; using merged SLAM unchanged")
+        return data, False
+
+    traj = np.asarray(data['traj'], dtype=np.float32).copy()
+    t = torch.from_numpy(traj[:, :3])
+    q_wxyz = torch.from_numpy(traj[:, [6, 3, 4, 5]].copy())
+
+    # Seams are the recorded per-window SLAM restart frames (the hard chunk
+    # boundaries the merge wrote); they are never inferred from pose geometry.
+    # Older single-window outputs do not carry this metadata, and need no stitch.
+    if 'window_starts' not in data:
+        print("Stitch: branch=legacy_single_window; no window_starts metadata, "
+              "using SLAM unchanged")
+        return data, False
+    starts = sorted(int(x) for x in np.asarray(data['window_starts']).reshape(-1))
+    boundaries = [b for b in starts if b > starts[0] and 0 < b < len(t)]
+    if not boundaries:
+        print(f"Stitch: branch=single_window; window_starts={starts}, using SLAM unchanged")
+        return data, False
+    print(f"Stitch: branch=metadata_stitch; chaining {len(boundaries)} window boundary(ies) from recorded "
+          f"window_starts: {boundaries}")
+
+    T4 = torch.eye(4).repeat(len(t), 1, 1)
+    T4[:, :3, :3] = quaternion_to_rotation_matrix(q_wxyz)
+    T4[:, :3, 3] = t
+    ends = boundaries[1:] + [len(t)]
+    for b, e in zip(boundaries, ends):
+        A = T4[b - 1] @ torch.linalg.inv(T4[b])
+        T4[b:e] = A @ T4[b:e]
+    traj[:, :3] = T4[:, :3, 3].numpy()
+    traj[:, 3:7] = rotation_matrix_to_quaternion(T4[:, :3, :3])[:, [1, 2, 3, 0]].numpy()
+
+    out_data = {k: v for k, v in data.items() if k != 'disps'}
+    out_data['traj'] = traj
+    return out_data, True
+
+
 def stitch_slam_npz(seq_dir, slam_path):
     """Make a merged SLAM trajectory continuous across window restarts.
 
@@ -76,48 +122,14 @@ def stitch_slam_npz(seq_dir, slam_path):
     <seq_dir>/vis_stitched/SLAM/ (same filename, `disps` dropped) with
     cam_space symlinked next to it so the infiller runs against stitched poses.
     """
-    from hawor.utils.rotation import quaternion_to_rotation_matrix, rotation_matrix_to_quaternion
-
-    data = dict(np.load(slam_path, allow_pickle=True))
-    if bool(np.asarray(data.get('overlap_aligned', False)).reshape(-1)[0]):
-        print("Stitch: branch=overlap_aligned; using merged SLAM unchanged")
+    data, changed = stitch_slam_data(slam_path)
+    if not changed:
         return slam_path, seq_dir
-
-    traj = np.asarray(data['traj'], dtype=np.float32).copy()
-    t = torch.from_numpy(traj[:, :3])
-    q_wxyz = torch.from_numpy(traj[:, [6, 3, 4, 5]].copy())
-
-    # Seams are the recorded per-window SLAM restart frames (the hard chunk
-    # boundaries the merge wrote); they are never inferred from pose geometry.
-    # Older single-window outputs do not carry this metadata, and need no stitch.
-    if 'window_starts' not in data:
-        print("Stitch: branch=legacy_single_window; no window_starts metadata, "
-              "using SLAM unchanged")
-        return slam_path, seq_dir
-    starts = sorted(int(x) for x in np.asarray(data['window_starts']).reshape(-1))
-    boundaries = [b for b in starts if b > starts[0] and 0 < b < len(t)]
-    if not boundaries:
-        print(f"Stitch: branch=single_window; window_starts={starts}, using SLAM unchanged")
-        return slam_path, seq_dir
-    print(f"Stitch: branch=metadata_stitch; chaining {len(boundaries)} window boundary(ies) from recorded "
-          f"window_starts: {boundaries}")
-
-    T4 = torch.eye(4).repeat(len(t), 1, 1)
-    T4[:, :3, :3] = quaternion_to_rotation_matrix(q_wxyz)
-    T4[:, :3, 3] = t
-    ends = boundaries[1:] + [len(t)]
-    for b, e in zip(boundaries, ends):
-        A = T4[b - 1] @ torch.linalg.inv(T4[b])
-        T4[b:e] = A @ T4[b:e]
-    traj[:, :3] = T4[:, :3, 3].numpy()
-    traj[:, 3:7] = rotation_matrix_to_quaternion(T4[:, :3, :3])[:, [1, 2, 3, 0]].numpy()
 
     shadow = os.path.join(seq_dir, 'vis_stitched')
     os.makedirs(os.path.join(shadow, 'SLAM'), exist_ok=True)
     out_npz = os.path.join(shadow, 'SLAM', os.path.basename(slam_path))
-    out_data = {k: v for k, v in data.items() if k != 'disps'}
-    out_data['traj'] = traj
-    np.savez(out_npz, **out_data)
+    np.savez(out_npz, **data)
     cam_link = os.path.join(shadow, 'cam_space')
     if not os.path.exists(cam_link):
         os.symlink(os.path.abspath(os.path.join(seq_dir, 'cam_space')), cam_link)
@@ -125,13 +137,18 @@ def stitch_slam_npz(seq_dir, slam_path):
     return out_npz, shadow
 
 
-def load_or_build_world_res(args, seq_dir, start_idx, end_idx):
+def load_or_build_world_res(args, seq_dir, start_idx, end_idx, allow_build=True):
     res_path = os.path.join(seq_dir, 'world_space_res.pth')
     if os.path.exists(res_path):
         print(f"Loading {res_path}")
         import joblib
         return joblib.load(res_path)
 
+    if not allow_build:
+        raise SystemExit(
+            f"{res_path} not found; offline SLAM visualization is read-only. "
+            "Run scripts/build_world_space_res.py first."
+        )
     if not args.video_path:
         raise SystemExit(
             f"{res_path} not found; rebuilding it runs the infiller, which needs "

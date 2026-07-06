@@ -323,7 +323,7 @@ class JobManager:
                         # finishes, instead of waiting for the entire job to
                         # complete. This prevents disk exhaustion when a job
                         # contains thousands of videos.
-                        if video_scratch.exists():
+                        if self.config.cleanup_intermediate and video_scratch.exists():
                             shutil.rmtree(video_scratch, ignore_errors=True)
 
                 self._fill_inflight(
@@ -367,7 +367,7 @@ class JobManager:
         return HaWoRVideoProcessorForService(
             config=HaWoRProcessorConfig(
                 vis_mode=vis_mode,
-                cleanup_intermediate=False,
+                cleanup_intermediate=self.config.cleanup_intermediate,
                 copy_extracted_images=self.config.copy_extracted_images,
             ),
             gpu_pool=self._gpu_pool,

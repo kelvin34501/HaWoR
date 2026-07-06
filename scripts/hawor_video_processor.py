@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,8 @@ class HaWoRProcessResult:
     extracted_images_50fps_dir: Optional[Path]
     world_space_res_path: Optional[Path]
     world_space_res_50fps_path: Optional[Path]
+    cam_space_vis_path: Optional[Path]
+    world_space_vis_path: Optional[Path]
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,7 @@ class HaWoRProcessorConfig:
     # timeline to produce a world-space result (world_space_res.pth).
     run_world_space: bool = True
     infiller_weight: str = "./weights/hawor/checkpoints/infiller.pt"
+    run_visualizations: bool = True
 
 
 class GpuPool:
@@ -107,7 +111,7 @@ class HaWoRVideoProcessor:
         """Process one video and write annotation artifacts into output_dir.
 
         The returned output directory contains the merged annotation artifacts:
-        cam_space/, SLAM/, extracted_images/, and optionally 50fps outputs.
+        cam_space/, SLAM/, visualizations, and optionally world/50fps outputs.
         This method blocks until a GPU is available.
         """
 
@@ -128,6 +132,8 @@ class HaWoRVideoProcessor:
             env = self._build_env(gpu_id)
             self._run_segmented_pipeline(video, work_dir, log_path, gpu_id, env)
             self._copy_merged_outputs(work_dir, out_dir, overwrite_output)
+            if self.config.cleanup_intermediate and work_dir.exists():
+                shutil.rmtree(work_dir)
 
             # Stitch merged SLAM + infill the full sequence -> world_space_res.pth.
             # Runs before interpolation so the 50fps step can interpolate it too.
@@ -140,8 +146,11 @@ class HaWoRVideoProcessor:
             if self.config.run_post_steps or self.config.force_interpolate:
                 self._run_interpolation(out_dir, video, log_path, env)
 
-            if self.config.cleanup_intermediate and work_dir.exists():
-                shutil.rmtree(work_dir)
+            world_space_vis_path: Optional[Path] = None
+            if self.config.run_visualizations:
+                self._run_cam_space_visualization(out_dir, video, log_path, env)
+                if self.config.run_world_space:
+                    world_space_vis_path = self._run_world_space_visualization(out_dir, video, log_path, env)
 
             return HaWoRProcessResult(
                 video_path=video,
@@ -157,6 +166,9 @@ class HaWoRVideoProcessor:
                                       if self.config.run_world_space else None),
                 world_space_res_50fps_path=(out_dir / "world_space_res_50fps.pth"
                                             if self.config.run_world_space else None),
+                cam_space_vis_path=(out_dir / "cam_space_visualization.mp4"
+                                    if self.config.run_visualizations else None),
+                world_space_vis_path=world_space_vis_path,
             )
 
     def _validate_config(self) -> None:
@@ -219,12 +231,8 @@ class HaWoRVideoProcessor:
         if not merged_dir.is_dir():
             raise FileNotFoundError(f"Merged output directory not found: {merged_dir}")
 
-        for name in ("cam_space", "SLAM"):
-            src = merged_dir / name
-            if not src.exists():
-                continue
-
-            dst = output_dir / name
+        for src in sorted(merged_dir.iterdir()):
+            dst = output_dir / src.name
             if dst.exists():
                 if overwrite_output:
                     if dst.is_dir():
@@ -253,6 +261,9 @@ class HaWoRVideoProcessor:
             output_dir / "extracted_images_50fps",
             output_dir / "world_space_res.pth",
             output_dir / "world_space_res_50fps.pth",
+            output_dir / "cam_space_visualization.mp4",
+            output_dir / "world_space_visualization.mp4",
+            output_dir / "world_space_visualization_50fps.mp4",
         ]
 
         for path in paths:
@@ -284,6 +295,86 @@ class HaWoRVideoProcessor:
             str(self.config.target_fps),
         ]
         self._run_command(cmd, log_path, env)
+
+    def _run_cam_space_visualization(
+        self,
+        seq_dir: Path,
+        video: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "visualize_reconstructed_video.py"
+        cam_space_dir = seq_dir / "cam_space_50fps"
+        fps = self.config.interp_target_fps
+        if not cam_space_dir.is_dir():
+            cam_space_dir = seq_dir / "cam_space"
+            fps = self.config.target_fps
+        cmd = [
+            self.config.python_bin,
+            str(script),
+            "--video_path",
+            str(video),
+            "--cam_space_dir",
+            str(cam_space_dir),
+            "--output",
+            str(seq_dir / "cam_space_visualization.mp4"),
+            "--fps",
+            str(int(round(fps))),
+        ]
+        self._run_command(cmd, log_path, env)
+
+    def _run_world_space_visualization(
+        self,
+        seq_dir: Path,
+        video: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> Path:
+        script = self.config.project_dir / "scripts" / "visualize_world_reconstructed_video.py"
+        world_space_res = seq_dir / "world_space_res_50fps.pth"
+        output_path = seq_dir / "world_space_visualization_50fps.mp4"
+        fps = self.config.interp_target_fps
+        slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=True)
+        if not world_space_res.is_file():
+            world_space_res = seq_dir / "world_space_res.pth"
+            output_path = seq_dir / "world_space_visualization.mp4"
+            fps = self.config.target_fps
+            slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
+        cmd = [
+            self.config.python_bin,
+            str(script),
+            "--video_path",
+            str(video),
+            "--seq_dir",
+            str(seq_dir),
+            "--world_space_res",
+            str(world_space_res),
+            "--slam_npz",
+            str(slam_npz),
+            "--output",
+            str(output_path),
+            "--fps",
+            str(int(round(fps))),
+        ]
+        self._run_command(cmd, log_path, env)
+        return output_path
+
+    def _find_visualization_slam_npz(self, seq_dir: Path, *, prefer_50fps: bool) -> Path:
+        slam_dir = seq_dir / "SLAM"
+        suffix = "_50fps" if prefer_50fps else ""
+        pattern = re.compile(rf"^hawor_slam_w_scale_\d+_\d+{suffix}\.npz$")
+        candidates = sorted(
+            path for path in slam_dir.glob("hawor_slam_w_scale_*.npz")
+            if pattern.match(path.name) and "_disps_" not in path.name
+        )
+        if not candidates and prefer_50fps:
+            return self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
+        if not candidates:
+            raise FileNotFoundError(f"No matching SLAM npz found under {slam_dir}")
+        if len(candidates) > 1:
+            listing = "\n  ".join(str(path) for path in candidates)
+            raise RuntimeError(f"Multiple SLAM npz files found for visualization:\n  {listing}")
+        return candidates[0]
 
     def _run_interpolation(
         self,
@@ -385,6 +476,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_world_space", action="store_true",
                         help="skip stitching + full-sequence infiller world-space reconstruction")
     parser.add_argument("--infiller_weight", default="./weights/hawor/checkpoints/infiller.pt")
+    parser.add_argument("--no_visualizations", action="store_true",
+                        help="skip cam-space and world-space overlay video rendering")
     parser.add_argument("--no_post_steps", action="store_true")
     parser.add_argument("--force_interpolate", action="store_true")
     parser.add_argument("--keep_intermediate", action="store_true")
@@ -403,6 +496,7 @@ def main() -> None:
         vis_mode=args.vis_mode,
         run_world_space=not args.no_world_space,
         infiller_weight=args.infiller_weight,
+        run_visualizations=not args.no_visualizations,
         run_post_steps=not args.no_post_steps,
         force_interpolate=args.force_interpolate,
         cleanup_intermediate=not args.keep_intermediate,
