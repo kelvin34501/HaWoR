@@ -214,6 +214,23 @@ def _normalize_quat_xyzw(quat):
     return quat / norm
 
 
+def _interpolated_slam_metadata(data, t_new):
+    """Carry raw-SLAM merge metadata onto the interpolated timeline."""
+    meta = {}
+    if "overlap_aligned" in data:
+        meta["overlap_aligned"] = data["overlap_aligned"]
+    if "window_starts" in data:
+        starts = sorted(int(x) for x in np.asarray(data["window_starts"]).reshape(-1))
+        mapped = []
+        for start in starts:
+            idx = int(np.searchsorted(t_new, float(start), side="left"))
+            idx = max(0, min(idx, len(t_new) - 1))
+            mapped.append(idx)
+        meta["window_starts"] = np.asarray(sorted(set(mapped)), dtype=np.int64)
+        meta["source_window_starts"] = np.asarray(starts, dtype=np.int64)
+    return meta
+
+
 def interpolate_slam_artifacts(folder_path, src_frame_count, dst_frame_count):
     slam_dir = os.path.join(folder_path, "SLAM")
     if not os.path.isdir(slam_dir):
@@ -281,6 +298,7 @@ def interpolate_slam_artifacts(folder_path, src_frame_count, dst_frame_count):
             img_focal=data["img_focal"],
             img_center=data["img_center"],
             scale=data["scale"],
+            **_interpolated_slam_metadata(data, t_new),
         )
         out_count += 1
 
@@ -470,6 +488,10 @@ def _finalize_existing_slam_50fps(folder_path):
             raise ValueError("Existing SLAM 50fps npz files have inconsistent frame counts")
 
         if "disps" in data:
+            meta = {}
+            for key in ("overlap_aligned", "window_starts", "source_window_starts"):
+                if key in data:
+                    meta[key] = data[key]
             np.savez(
                 slam_file,
                 tstamp=data["tstamp"],
@@ -477,6 +499,7 @@ def _finalize_existing_slam_50fps(folder_path):
                 img_focal=data["img_focal"],
                 img_center=data["img_center"],
                 scale=data["scale"],
+                **meta,
             )
             print(f"Removed disps field from existing SLAM 50fps npz: {slam_file}")
 
