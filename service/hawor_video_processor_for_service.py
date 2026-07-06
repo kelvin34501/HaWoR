@@ -34,6 +34,8 @@ class HaWoRProcessResult:
     slam_dir: Path
     extracted_images_dir: Path
     extracted_images_50fps_dir: Optional[Path]
+    world_space_res_path: Optional[Path]
+    world_space_res_50fps_path: Optional[Path]
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,10 @@ class HaWoRProcessorConfig:
     run_post_steps: bool = True
     force_interpolate: bool = False
     cleanup_intermediate: bool = True
+    # Stitch the merged multi-window SLAM and run the infiller over the full
+    # timeline to produce a world-space result (world_space_res.pth).
+    run_world_space: bool = True
+    infiller_weight: str = "./weights/hawor/checkpoints/infiller.pt"
     # Frames are decoded on demand from the video; nothing is extracted to disk, so
     # this flag is accepted for API compatibility but has no effect.
     copy_extracted_images: bool = True
@@ -138,6 +144,12 @@ class HaWoRVideoProcessorForService:
                 self._run_segmented_pipeline(video, work_dir, live_log_path, gpu_id, env)
                 self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
 
+                # Stitch merged SLAM + infill the full sequence -> world_space_res.pth.
+                # Runs on the staged dir before interpolation so it flows to out_dir
+                # with the staged copy and the 50fps step can interpolate it too.
+                if self.config.run_world_space:
+                    self._build_world_space_res(staged_output_dir, video, live_log_path, env)
+
                 # Frames are never extracted to disk; the 50fps interpolation derives
                 # its frame count directly from the video.
                 extracted_images_50fps_dir: Optional[Path] = None
@@ -166,6 +178,10 @@ class HaWoRVideoProcessorForService:
                 extracted_images_dir=out_dir / "extracted_images",
                 extracted_images_50fps_dir=(out_dir / "extracted_images_50fps"
                                             if extracted_images_50fps_dir is not None else None),
+                world_space_res_path=(out_dir / "world_space_res.pth"
+                                      if self.config.run_world_space else None),
+                world_space_res_50fps_path=(out_dir / "world_space_res_50fps.pth"
+                                            if self.config.run_world_space else None),
             )
 
     def _validate_config(self) -> None:
@@ -322,6 +338,28 @@ class HaWoRVideoProcessorForService:
             shutil.copyfile(local_sentinel, remote_sentinel)
         except OSError:
             pass
+
+    def _build_world_space_res(
+        self,
+        seq_dir: Path,
+        video: Path,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> None:
+        script = self.config.project_dir / "scripts" / "build_world_space_res.py"
+        cmd = [
+            sys.executable,
+            str(script),
+            "--seq_dir",
+            str(seq_dir),
+            "--video_path",
+            str(video),
+            "--infiller_weight",
+            str(self.config.infiller_weight),
+            "--target_fps",
+            str(self.config.target_fps),
+        ]
+        self._run_command(cmd, log_path, env)
 
     def _run_interpolation(
         self,

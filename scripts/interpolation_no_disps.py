@@ -273,7 +273,7 @@ def interpolate_slam_artifacts(folder_path, src_frame_count, dst_frame_count):
         base_name = os.path.basename(slam_file)
         base_name = os.path.splitext(base_name)[0]
         base_name = re.sub(r'_\d+_\d+$', '', base_name)
-        out_file = os.path.join(os.path.dirname(slam_file), f"{base_name}_0_{dst_frame_count-1}_50fps.npz")
+        out_file = os.path.join(os.path.dirname(slam_file), f"{base_name}_0_{dst_frame_count}_50fps.npz")
         np.savez(
             out_file,
             tstamp=tstamp_new,

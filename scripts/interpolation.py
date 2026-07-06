@@ -281,10 +281,10 @@ def interpolate_slam_artifacts(folder_path, src_frame_count, dst_frame_count):
         base_name = os.path.basename(slam_file)
         base_name = os.path.splitext(base_name)[0]
         base_name = re.sub(r'_\d+_\d+$', '', base_name)
-        out_file = os.path.join(os.path.dirname(slam_file), f"{base_name}_0_{dst_frame_count-1}_50fps.npz")
+        out_file = os.path.join(os.path.dirname(slam_file), f"{base_name}_0_{dst_frame_count}_50fps.npz")
         out_disps_file = os.path.join(
             os.path.dirname(slam_file),
-            f"{base_name}_disps_0_{dst_frame_count-1}_50fps.npz",
+            f"{base_name}_disps_0_{dst_frame_count}_50fps.npz",
         )
         np.savez(
             out_file,
@@ -585,9 +585,8 @@ def main():
             "Install project requirements first (numpy, scipy, torch, joblib)."
         ) from _IMPORT_ERROR
 
-    # in_path = os.path.join(args.folder_path, "world_space_res.pth")
-    # if not os.path.exists(in_path):
-    #     raise FileNotFoundError(f"Input file not found: {in_path}")
+    in_path = os.path.join(args.folder_path, "world_space_res.pth")
+    has_world = os.path.exists(in_path)
 
     if args.video_path:
         # Derive frame counts by decoding the video on demand (no JPEGs on disk).
@@ -607,25 +606,13 @@ def main():
         src_frame_count = _count_images(source_dir)
         dst_frame_count = _count_images(target_dir)
 
-    # world_data = joblib.load(in_path)
-    # interp_data = interpolate_world_space(world_data, src_frame_count, dst_frame_count)
-
-#     out_name = args.output_name or "world_space_res_50fps.pth"
-#     out_path = os.path.join(args.folder_path, out_name)
-#     joblib.dump(interp_data, out_path)
-
-#     old_len = _to_numpy(world_data[0]).shape[1]
-#     new_len = _to_numpy(interp_data[0]).shape[1]
-#     print(f"Saved interpolated world-space result to: {out_path}")
-#     print(f"Image count (timeline): {src_frame_count} -> {dst_frame_count}")
-#     print(f"World data frame count: {old_len} -> {new_len}")
-
-#     interpolate_cam_space(args.folder_path, src_frame_count, dst_frame_count)
-#     interpolate_slam_artifacts(args.folder_path, src_frame_count, dst_frame_count)
     out_name = args.output_name or "world_space_res_50fps.pth"
     out_path = os.path.join(args.folder_path, out_name)
 
-    # world_done = _is_world_space_done(out_path, dst_frame_count)
+    # world_space_res.pth is optional: only interpolate it when the infiller
+    # produced one. When absent, treat world-space as "done" so it never blocks
+    # the cam_space/SLAM/disps interpolation that always runs.
+    world_done = (not has_world) or _is_world_space_done(out_path, dst_frame_count)
     cam_done = _is_cam_space_done(args.folder_path, "cam_space_50fps", dst_frame_count)
     slam_done = _is_slam_done(args.folder_path, dst_frame_count)
     disps_done = _is_disps_done(args.folder_path, dst_frame_count)
@@ -633,27 +620,27 @@ def main():
 
     print(f"Image count (timeline): {src_frame_count} -> {dst_frame_count}")
     print(f"Check existing outputs:")
-    # print(f"  world_space: {'done' if world_done else 'missing/incomplete'}")
+    print(f"  world_space: {'done' if world_done else 'missing/incomplete'}"
+          f"{'' if has_world else ' (no world_space_res.pth; skipped)'}")
     print(f"  cam_space:   {'done' if cam_done else 'missing/incomplete'}")
     print(f"  SLAM:        {'done' if slam_done else 'missing/incomplete'}")
     print(f"  disps_npz:   {'done' if disps_done else 'missing/incomplete'}")
     print(f"  disps_video: {'done' if disps_video_done else 'missing/incomplete'}")
 
-    if  cam_done and slam_done and disps_done and disps_video_done:
+    if world_done and cam_done and slam_done and disps_done and disps_video_done:
         print("All interpolation outputs already exist and match target frame count. Skip.")
         return
 
-    # world_data = joblib.load(in_path)
-    # old_len = _to_numpy(world_data[0]).shape[1]
-
-    # if not world_done:
-    #     interp_data = interpolate_world_space(world_data, src_frame_count, dst_frame_count)
-    #     joblib.dump(interp_data, out_path)
-    #     new_len = _to_numpy(interp_data[0]).shape[1]
-    #     print(f"Saved interpolated world-space result to: {out_path}")
-    #     print(f"World data frame count: {old_len} -> {new_len}")
-    # else:
-    #     print(f"Skip world-space interpolation: already done -> {out_path}")
+    if has_world and not world_done:
+        world_data = joblib.load(in_path)
+        old_len = _to_numpy(world_data[0]).shape[1]
+        interp_data = interpolate_world_space(world_data, src_frame_count, dst_frame_count)
+        joblib.dump(interp_data, out_path)
+        new_len = _to_numpy(interp_data[0]).shape[1]
+        print(f"Saved interpolated world-space result to: {out_path}")
+        print(f"World data frame count: {old_len} -> {new_len}")
+    elif has_world:
+        print(f"Skip world-space interpolation: already done -> {out_path}")
 
     if not cam_done:
         interpolate_cam_space(args.folder_path, src_frame_count, dst_frame_count)
@@ -674,7 +661,7 @@ def main():
         return
 
     for disps_file in disps_files:
-        disps_npz_to_uint16_video(disps_file, fps=50, overwrite=False)
+        disps_npz_to_uint16_video(disps_file, fps=args.target_fps, overwrite=False)
 
 
 if __name__ == "__main__":
