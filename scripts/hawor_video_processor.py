@@ -146,9 +146,10 @@ class HaWoRVideoProcessor:
             if self.config.run_post_steps or self.config.force_interpolate:
                 self._run_interpolation(out_dir, video, log_path, env)
 
+            cam_space_vis_path: Optional[Path] = None
             world_space_vis_path: Optional[Path] = None
             if self.config.run_visualizations:
-                self._run_cam_space_visualization(out_dir, video, log_path, env)
+                cam_space_vis_path = self._run_cam_space_visualization(out_dir, video, log_path, env)
                 if self.config.run_world_space:
                     world_space_vis_path = self._run_world_space_visualization(out_dir, video, log_path, env)
 
@@ -166,8 +167,7 @@ class HaWoRVideoProcessor:
                                       if self.config.run_world_space else None),
                 world_space_res_50fps_path=(out_dir / "world_space_res_50fps.pth"
                                             if self.config.run_world_space else None),
-                cam_space_vis_path=(out_dir / "cam_space_visualization.mp4"
-                                    if self.config.run_visualizations else None),
+                cam_space_vis_path=cam_space_vis_path,
                 world_space_vis_path=world_space_vis_path,
             )
 
@@ -262,9 +262,12 @@ class HaWoRVideoProcessor:
             output_dir / "world_space_res.pth",
             output_dir / "world_space_res_50fps.pth",
             output_dir / "cam_space_visualization.mp4",
+            output_dir / "cam_space_visualization_50fps.mp4",
             output_dir / "world_space_visualization.mp4",
             output_dir / "world_space_visualization_50fps.mp4",
         ]
+        paths.extend(sorted(output_dir.glob("cam_space_visualization_*fps.mp4")))
+        paths.extend(sorted(output_dir.glob("world_space_visualization_*fps.mp4")))
 
         for path in paths:
             if not path.exists():
@@ -302,13 +305,16 @@ class HaWoRVideoProcessor:
         video: Path,
         log_path: Path,
         env: dict[str, str],
-    ) -> None:
+    ) -> Path:
         script = self.config.project_dir / "scripts" / "visualize_reconstructed_video.py"
         cam_space_dir = seq_dir / "cam_space_50fps"
-        fps = self.config.interp_target_fps
+        render_fps = int(round(self.config.interp_target_fps))
         if not cam_space_dir.is_dir():
             cam_space_dir = seq_dir / "cam_space"
-            fps = self.config.target_fps
+            render_fps = int(round(self.config.target_fps))
+        if not cam_space_dir.is_dir():
+            raise FileNotFoundError(f"Camera-space directory not found: {cam_space_dir}")
+        output_path = seq_dir / f"cam_space_visualization_{render_fps}fps.mp4"
         cmd = [
             self.config.python_bin,
             str(script),
@@ -317,11 +323,12 @@ class HaWoRVideoProcessor:
             "--cam_space_dir",
             str(cam_space_dir),
             "--output",
-            str(seq_dir / "cam_space_visualization.mp4"),
+            str(output_path),
             "--fps",
-            str(int(round(fps))),
+            str(render_fps),
         ]
         self._run_command(cmd, log_path, env)
+        return output_path
 
     def _run_world_space_visualization(
         self,
@@ -331,15 +338,24 @@ class HaWoRVideoProcessor:
         env: dict[str, str],
     ) -> Path:
         script = self.config.project_dir / "scripts" / "visualize_world_reconstructed_video.py"
-        world_space_res = seq_dir / "world_space_res_50fps.pth"
-        output_path = seq_dir / "world_space_visualization_50fps.mp4"
-        fps = self.config.interp_target_fps
-        slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=True)
-        if not world_space_res.is_file():
+        world_space_res_50fps = seq_dir / "world_space_res_50fps.pth"
+        slam_npz: Optional[Path] = None
+        if world_space_res_50fps.is_file():
+            try:
+                slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=True)
+            except FileNotFoundError:
+                slam_npz = None
+
+        if slam_npz is not None:
+            world_space_res = world_space_res_50fps
+            render_fps = int(round(self.config.interp_target_fps))
+        else:
             world_space_res = seq_dir / "world_space_res.pth"
-            output_path = seq_dir / "world_space_visualization.mp4"
-            fps = self.config.target_fps
+            render_fps = int(round(self.config.target_fps))
+            if not world_space_res.is_file():
+                raise FileNotFoundError(f"World-space result not found: {world_space_res}")
             slam_npz = self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
+        output_path = seq_dir / f"world_space_visualization_{render_fps}fps.mp4"
         cmd = [
             self.config.python_bin,
             str(script),
@@ -354,7 +370,7 @@ class HaWoRVideoProcessor:
             "--output",
             str(output_path),
             "--fps",
-            str(int(round(fps))),
+            str(render_fps),
         ]
         self._run_command(cmd, log_path, env)
         return output_path
@@ -367,8 +383,6 @@ class HaWoRVideoProcessor:
             path for path in slam_dir.glob("hawor_slam_w_scale_*.npz")
             if pattern.match(path.name) and "_disps_" not in path.name
         )
-        if not candidates and prefer_50fps:
-            return self._find_visualization_slam_npz(seq_dir, prefer_50fps=False)
         if not candidates:
             raise FileNotFoundError(f"No matching SLAM npz found under {slam_dir}")
         if len(candidates) > 1:
