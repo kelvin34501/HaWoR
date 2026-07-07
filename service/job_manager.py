@@ -369,6 +369,7 @@ class JobManager:
                 vis_mode=vis_mode,
                 cleanup_intermediate=self.config.cleanup_intermediate,
                 copy_extracted_images=self.config.copy_extracted_images,
+                run_visualizations=self.config.run_visualizations,
             ),
             gpu_pool=self._gpu_pool,
         )

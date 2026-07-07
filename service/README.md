@@ -28,6 +28,7 @@ export HAWOR_JOBS_PER_GPU=1
 export HAWOR_CLEANUP_INTERMEDIATE=true
 export HAWOR_CLEANUP_FAILED_CACHE=false
 export HAWOR_COPY_EXTRACTED_IMAGES=false
+export HAWOR_RUN_VISUALIZATIONS=false
 export HAWOR_S3MOUNT_BIN=/mnt/petrelfs/share_data/s3mount
 export HAWOR_MOUNT_ROOT=/mnt/oss
 export HAWOR_MOUNT_READY_TIMEOUT=30
@@ -43,6 +44,7 @@ Common startup options:
 - `--cleanup-intermediate` / `--no-cleanup-intermediate`: control whether successful job cache directories are deleted.
 - `--cleanup-failed-cache`: delete failed job cache directories instead of preserving them for debugging.
 - `--copy-extracted-images` / `--no-copy-extracted-images`: **deprecated no-op.** Frames are now decoded on demand from the video (`FrameSource`) and are never written to disk, so there are no `extracted_images`/`extracted_images_50fps` directories to copy. The flag (and `HAWOR_COPY_EXTRACTED_IMAGES`) is still accepted but has no effect.
+- `--run-visualizations` / `--no-run-visualizations` (`HAWOR_RUN_VISUALIZATIONS`): render the cam-space/world-space visualization videos (`cam_space_visualization_*fps.mp4`, `world_space_visualization_*fps.mp4`) after processing each video (default `false`).
 - `--s3mount-bin`: path to the `s3mount` binary (default `s3mount` on `PATH`).
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).

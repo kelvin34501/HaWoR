@@ -57,6 +57,7 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
             "cleanup_failed_cache": config.cleanup_failed_cache,
             "mount_root": str(config.mount_root),
             "mount_ready_timeout": config.mount_ready_timeout,
+            "run_visualizations": config.run_visualizations,
         }
 
     @app.post("/v1/annotate", status_code=202)
@@ -134,6 +135,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Delete failed job cache directories instead of keeping them for debugging",
     )
     parser.add_argument(
+        "--run-visualizations",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Render cam-space/world-space visualization videos after processing "
+             "(default false; also HAWOR_RUN_VISUALIZATIONS)",
+    )
+    parser.add_argument(
         "--copy-extracted-images",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -151,6 +159,7 @@ def main() -> None:
         cleanup_intermediate=args.cleanup_intermediate,
         cleanup_failed_cache=args.cleanup_failed_cache,
         copy_extracted_images=args.copy_extracted_images,
+        run_visualizations=args.run_visualizations,
         host=args.host,
         port=args.port,
         max_workers=args.max_workers,
