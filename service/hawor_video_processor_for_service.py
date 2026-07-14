@@ -45,7 +45,8 @@ class HaWoRProcessResult:
 class HaWoRProcessorConfig:
     project_dir: Path = Path(__file__).resolve().parents[1]
     segment_seconds: int = 100
-    min_last_segment_seconds: int = 60
+    min_last_segment_seconds: int = 50
+    max_chunk_frames: int = 3001
     overlap_policy: str = "keep_last"
     vis_mode: str = "off"
     target_fps: float = 30
@@ -211,6 +212,8 @@ class HaWoRVideoProcessorForService:
             raise ValueError("segment_seconds must be positive")
         if self.config.min_last_segment_seconds < 0:
             raise ValueError("min_last_segment_seconds must be non-negative")
+        if self.config.max_chunk_frames < 2:
+            raise ValueError("max_chunk_frames must be >= 2")
         if self.config.overlap_policy not in {"keep_last", "keep_first"}:
             raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
         if shutil.which(sys.executable) is None:
@@ -241,6 +244,8 @@ class HaWoRVideoProcessorForService:
             str(self.config.segment_seconds),
             "--min_last_segment_seconds",
             str(self.config.min_last_segment_seconds),
+            "--max_chunk_frames",
+            str(self.config.max_chunk_frames),
             "--overlap_policy",
             self.config.overlap_policy,
             "--vis_mode",

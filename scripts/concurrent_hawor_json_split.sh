@@ -5,7 +5,8 @@ shopt -s nullglob
 
 # ===== User strategy (confirmed) =====
 SEGMENT_SECONDS="${SEGMENT_SECONDS:-100}"
-MIN_LAST_SEGMENT_SECONDS="${MIN_LAST_SEGMENT_SECONDS:-60}"
+MIN_LAST_SEGMENT_SECONDS="${MIN_LAST_SEGMENT_SECONDS:-50}"
+MAX_CHUNK_FRAMES="${MAX_CHUNK_FRAMES:-3001}"
 SPLIT_MODE="${SPLIT_MODE:-reencode}"          # copy | reencode
 OVERLAP_POLICY="${OVERLAP_POLICY:-keep_last}" # keep_last | keep_first
 
@@ -121,6 +122,11 @@ if [[ ! "$MIN_LAST_SEGMENT_SECONDS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+if [[ ! "$MAX_CHUNK_FRAMES" =~ ^[0-9]+$ ]] || (( MAX_CHUNK_FRAMES < 2 )); then
+    echo "ERROR: MAX_CHUNK_FRAMES must be an integer >= 2, got: $MAX_CHUNK_FRAMES" >&2
+    exit 1
+fi
+
 if [[ "$SPLIT_MODE" != "copy" && "$SPLIT_MODE" != "reencode" ]]; then
     echo "ERROR: SPLIT_MODE must be copy or reencode, got: $SPLIT_MODE" >&2
     exit 1
@@ -178,13 +184,14 @@ run_one_video() {
 
     {
         echo "[$(timestamp)] START video=$video_path gpu=$gpu_id"
-        echo "[$(timestamp)] strategy: segment=${SEGMENT_SECONDS}s min_last_segment=${MIN_LAST_SEGMENT_SECONDS}s split_mode=$SPLIT_MODE overlap=$OVERLAP_POLICY"
+        echo "[$(timestamp)] strategy: segment=${SEGMENT_SECONDS}s min_last_segment=${MIN_LAST_SEGMENT_SECONDS}s max_chunk_frames=$MAX_CHUNK_FRAMES split_mode=$SPLIT_MODE overlap=$OVERLAP_POLICY"
 
         export CUDA_VISIBLE_DEVICES="$gpu_id"
         "$PYTHON_BIN" "$PROJECT_DIR/scripts/segmented_demo_pipeline.py" \
             --video_path "$video_path" \
             --segment_seconds "$SEGMENT_SECONDS" \
             --min_last_segment_seconds "$MIN_LAST_SEGMENT_SECONDS" \
+            --max_chunk_frames "$MAX_CHUNK_FRAMES" \
             --overlap_policy "$OVERLAP_POLICY" \
             --vis_mode "$VIS_MODE" \
             --gpu_id "$gpu_id" \
@@ -270,7 +277,7 @@ echo "[$(timestamp)] root_dir=$ROOT_DIR" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] project_dir=$PROJECT_DIR" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] max_jobs=$MAX_JOBS parallel=$ENABLE_PARALLEL" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] gpu_pool=$(gpu_pool_to_string)" | tee -a "$LOG_FILE"
-echo "[$(timestamp)] strategy: segment=${SEGMENT_SECONDS}s min_last_segment=${MIN_LAST_SEGMENT_SECONDS}s split_mode=$SPLIT_MODE overlap=$OVERLAP_POLICY" | tee -a "$LOG_FILE"
+echo "[$(timestamp)] strategy: segment=${SEGMENT_SECONDS}s min_last_segment=${MIN_LAST_SEGMENT_SECONDS}s max_chunk_frames=$MAX_CHUNK_FRAMES split_mode=$SPLIT_MODE overlap=$OVERLAP_POLICY" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] run_post_steps=$RUN_POST_STEPS force_interpolate=$FORCE_INTERPOLATE" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] cleanup_intermediate=$CLEANUP_INTERMEDIATE" | tee -a "$LOG_FILE"
 echo "[$(timestamp)] skip_reconstructed=$SKIP_RECONSTRUCTED" | tee -a "$LOG_FILE"

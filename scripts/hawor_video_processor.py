@@ -47,7 +47,8 @@ class HaWoRProcessorConfig:
     project_dir: Path = Path(__file__).resolve().parents[1]
     python_bin: str = sys.executable
     segment_seconds: int = 100
-    min_last_segment_seconds: int = 60
+    min_last_segment_seconds: int = 50
+    max_chunk_frames: int = 3001
     overlap_policy: str = "keep_last"
     vis_mode: str = "off"
     target_fps: float = 30
@@ -176,6 +177,8 @@ class HaWoRVideoProcessor:
             raise ValueError("segment_seconds must be positive")
         if self.config.min_last_segment_seconds < 0:
             raise ValueError("min_last_segment_seconds must be non-negative")
+        if self.config.max_chunk_frames < 2:
+            raise ValueError("max_chunk_frames must be >= 2")
         if self.config.overlap_policy not in {"keep_last", "keep_first"}:
             raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
         if shutil.which(self.config.python_bin) is None:
@@ -206,6 +209,8 @@ class HaWoRVideoProcessor:
             str(self.config.segment_seconds),
             "--min_last_segment_seconds",
             str(self.config.min_last_segment_seconds),
+            "--max_chunk_frames",
+            str(self.config.max_chunk_frames),
             "--overlap_policy",
             self.config.overlap_policy,
             "--vis_mode",
@@ -483,7 +488,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu_ids", default="0", help='GPU pool, e.g. "0" or "0,1"')
     parser.add_argument("--python_bin", default=sys.executable)
     parser.add_argument("--segment_seconds", type=int, default=100)
-    parser.add_argument("--min_last_segment_seconds", type=int, default=60)
+    parser.add_argument("--min_last_segment_seconds", type=int, default=50)
+    parser.add_argument("--max_chunk_frames", type=int, default=3001)
     parser.add_argument("--target_fps", type=float, default=30)
     parser.add_argument("--overlap_policy", choices=["keep_last", "keep_first"], default="keep_last")
     parser.add_argument("--vis_mode", default="off")
@@ -505,6 +511,7 @@ def main() -> None:
         python_bin=args.python_bin,
         segment_seconds=args.segment_seconds,
         min_last_segment_seconds=args.min_last_segment_seconds,
+        max_chunk_frames=args.max_chunk_frames,
         target_fps=args.target_fps,
         overlap_policy=args.overlap_policy,
         vis_mode=args.vis_mode,

@@ -30,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from lib.pipeline.frame_source import FrameSource
+from lib.pipeline.window_planner import compute_windows, processing_windows
 
 
 RANGE_RE = re.compile(r"(\d+)_(\d+)(?:_50fps)?\.json$")
@@ -77,31 +78,6 @@ def seq_name_for_video(video_path: str) -> str:
 def count_frames(video_path: str, target_fps: float) -> int:
     """Number of frames in the (resampled) timeline demo.py will see."""
     return len(FrameSource(video_path, target_fps=target_fps))
-
-
-def compute_windows(
-    n_frames: int,
-    chunk_frames: int,
-    min_last_frames: int,
-) -> List[Tuple[int, int]]:
-    """Split [0, n_frames) into consecutive [start, end) windows.
-
-    A trailing window shorter than ``min_last_frames`` is merged into the previous
-    window (mirrors the old min-last-chunk-duration behaviour, in frame units).
-    """
-    if n_frames <= 0:
-        return []
-    if chunk_frames <= 0:
-        return [(0, n_frames)]
-
-    windows = [(s, min(s + chunk_frames, n_frames)) for s in range(0, n_frames, chunk_frames)]
-    if len(windows) >= 2 and min_last_frames > 0:
-        ls, le = windows[-1]
-        if (le - ls) < min_last_frames:
-            ps, _ = windows[-2]
-            windows[-2] = (ps, le)
-            windows.pop()
-    return windows
 
 
 def run_demo_on_chunk(
@@ -481,10 +457,6 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
     return out_path
 
 
-def processing_windows(windows: List[Tuple[int, int]], n_frames: int) -> List[Tuple[int, int]]:
-    return [(start, min(end + 1, n_frames)) for start, end in windows]
-
-
 def build_chunk_meta(windows: List[Tuple[int, int]], proc_windows: List[Tuple[int, int]], seq_dirs: List[str]) -> List[ChunkMeta]:
     metas: List[ChunkMeta] = []
     for (owned_start, owned_end), (process_start, process_end), seq_dir in zip(windows, proc_windows, seq_dirs):
@@ -546,11 +518,20 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
     chunk_frames = max(1, int(round(args.segment_seconds * args.target_fps)))
     min_last_frames = max(0, int(round(args.min_last_segment_seconds * args.target_fps)))
     n_frames = count_frames(video_abs, args.target_fps)
-    windows = compute_windows(n_frames, chunk_frames, min_last_frames)
+    windows = compute_windows(
+        n_frames,
+        chunk_frames,
+        min_last_frames,
+        max_chunk_frames=args.max_chunk_frames,
+    )
     if not windows:
         raise RuntimeError(f"No frames decoded from {video_abs}")
     proc_windows = processing_windows(windows, n_frames)
-    log(f"[plan ] {n_frames} frames @ {args.target_fps}fps -> {len(windows)} windows (+1 SLAM overlap)")
+    largest_process_window = max(end - start for start, end in proc_windows)
+    log(
+        f"[plan ] {n_frames} frames @ {args.target_fps}fps -> {len(windows)} windows "
+        f"(+1 SLAM overlap, largest={largest_process_window}, cap={args.max_chunk_frames})"
+    )
 
     seq_dirs: List[str] = [os.path.join(work_root, f"chunk_{i:06d}") for i in range(len(windows))]
 
@@ -656,8 +637,14 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--min_last_segment_seconds",
         type=int,
-        default=10,
-        help="Minimum allowed duration (seconds) for the final window; if shorter, merge into previous window",
+        default=50,
+        help="Preferred minimum duration for the final window; merge or rebalance it without exceeding --max_chunk_frames",
+    )
+    p.add_argument(
+        "--max_chunk_frames",
+        type=int,
+        default=3001,
+        help="Hard cap on frames processed by one window, including the one-frame SLAM overlap (default: 3001)",
     )
     p.add_argument("--target_fps", type=float, default=30, help="Decode/resample fps (matches old ffmpeg fps=N); passed to demo.py")
 
@@ -691,6 +678,8 @@ def main() -> None:
 
     if args.min_last_segment_seconds < 0:
         raise ValueError("--min_last_segment_seconds must be >= 0")
+    if args.max_chunk_frames < 2:
+        raise ValueError("--max_chunk_frames must be >= 2")
 
     videos = collect_videos(args)
     if not videos:
