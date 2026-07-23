@@ -483,6 +483,8 @@ def visualize_to_video(
     device: str = "cpu",
     render_mode: str = "both",
     mesh_alpha: float = 0.5,
+    start_frame: int = 0,
+    max_frames: Optional[int] = None,
 ) -> None:
     """Render HaWoR 2D hand projections into an MP4 overlay video.
 
@@ -499,6 +501,8 @@ def visualize_to_video(
         device: 'cpu' or 'cuda' for MANO forward pass.
         render_mode: 'skeleton', 'mesh', or 'both'.
         mesh_alpha: Opacity of hand mesh (0.0 - 1.0).
+        start_frame: Zero-based index of the first frame to render.
+        max_frames: Render only the first N frames when provided.
     """
     video_path = Path(video_path)
     cam_space_dir = Path(cam_space_dir)
@@ -513,7 +517,18 @@ def visualize_to_video(
         focal = _detect_focal(cam_space_dir)
 
     frames = FrameSource(str(video_path), target_fps=fps, color="bgr")
-    _render_overlay(frames, cam_space_dir, output_path, fps, focal, device, render_mode, mesh_alpha)
+    _render_overlay(
+        frames,
+        cam_space_dir,
+        output_path,
+        fps,
+        focal,
+        device,
+        render_mode,
+        mesh_alpha,
+        start_frame,
+        max_frames,
+    )
 
 
 def _render_overlay(
@@ -525,15 +540,34 @@ def _render_overlay(
     device: str,
     render_mode: str = "both",
     mesh_alpha: float = 0.5,
+    start_frame: int = 0,
+    max_frames: Optional[int] = None,
 ) -> None:
     """Internal: render hand overlay from on-demand video frames and cam_space data."""
-    n_frames = len(frames)
-    if n_frames == 0:
+    total_frames = len(frames)
+    if total_frames == 0:
         raise RuntimeError("FrameSource produced no frames")
+    if start_frame < 0:
+        raise ValueError("start_frame must be zero or greater")
+    if start_frame >= total_frames:
+        raise ValueError(
+            f"start_frame {start_frame} is outside the video ({total_frames} frames)"
+        )
+
+    end_frame = total_frames
+    if max_frames is not None:
+        if max_frames <= 0:
+            raise ValueError("max_frames must be greater than zero")
+        end_frame = min(total_frames, start_frame + max_frames)
+    n_frames = end_frame - start_frame
 
     h, w = frames.frame_shape
     cx, cy = w / 2, h / 2
-    print(f"Processing {n_frames} frames at {w}x{h}, focal={focal:.1f}, fps={fps}, mode={render_mode}", flush=True)
+    print(
+        f"Processing {n_frames} frames [{start_frame}, {end_frame}) at "
+        f"{w}x{h}, focal={focal:.1f}, fps={fps}, mode={render_mode}",
+        flush=True,
+    )
 
     # ---- pyrender renderers (one per hand side) ---------------------------------
     renderer_left: Optional[PyrenderHandRenderer] = None
@@ -603,7 +637,7 @@ def _render_overlay(
     color_right = (0, 150, 0)
 
     try:
-        for frame_idx in tqdm(range(n_frames), desc="Encoding video"):
+        for frame_idx in tqdm(range(start_frame, end_frame), desc="Encoding video"):
             if frame_idx % 100 == 0 and proc.poll() is not None:
                 raise RuntimeError(f"FFmpeg process died unexpectedly with return code {proc.returncode}")
 
@@ -676,6 +710,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         default="both",
                         help="Hand rendering style")
     parser.add_argument("--mesh_alpha", type=float, default=0.5, help="Opacity of hand mesh (0.0 - 1.0)")
+    parser.add_argument("--start_frame", type=int, default=0,
+                        help="Zero-based index of the first frame to render")
+    parser.add_argument("--max_frames", type=int, default=None,
+                        help="Maximum number of frames to render")
     return parser
 
 
@@ -691,6 +729,8 @@ def main() -> None:
         device=args.device,
         render_mode=args.render_mode,
         mesh_alpha=args.mesh_alpha,
+        start_frame=args.start_frame,
+        max_frames=args.max_frames,
     )
     print(f"Done: {args.output}", flush=True)
 
