@@ -45,6 +45,7 @@ class VideoItem:
     result_dir: str
     log_path: str
     error: Optional[str] = None
+    peak_rss_bytes: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +54,7 @@ class VideoItem:
             "result_dir": self.result_dir,
             "log_path": self.log_path,
             "error": self.error,
+            "peak_rss_bytes": self.peak_rss_bytes,
         }
 
 
@@ -370,6 +372,8 @@ class JobManager:
                 cleanup_intermediate=self.config.cleanup_intermediate,
                 copy_extracted_images=self.config.copy_extracted_images,
                 run_visualizations=self.config.run_visualizations,
+                decord_num_threads=self.config.decord_num_threads,
+                decord_recycle_after=self.config.decord_recycle_after,
             ),
             gpu_pool=self._gpu_pool,
         )
@@ -386,13 +390,17 @@ class JobManager:
     ) -> None:
         self._set_video_status(job_id, video_path.name, "RUNNING")
         self._update_job(job_id, stage="PROCESSING")
-        processor.process_video(
+        result = processor.process_video(
             video_path,
             output_dir,
             scratch_dir=scratch_dir,
             overwrite_output=overwrite,
             clear_on_overwrite=clear_on_overwrite,
+            peak_rss_callback=lambda peak: self._set_video_peak_rss(
+                job_id, video_path.name, peak
+            ),
         )
+        self._set_video_peak_rss(job_id, video_path.name, result.peak_rss_bytes)
 
     def _mark_video_succeeded(self, job_id: str, video_path: Path) -> None:
         with self._lock:
@@ -418,7 +426,16 @@ class JobManager:
             item = self._require_item(job, video_name)
             item.status = status
             if status == "RUNNING":
+                item.peak_rss_bytes = 0
                 job.stage = "PROCESSING"
+
+    def _set_video_peak_rss(self, job_id: str, video_name: str, peak_rss_bytes: int) -> None:
+        with self._lock:
+            job = self._require_job(job_id)
+            item = self._require_item(job, video_name)
+            peak = int(peak_rss_bytes)
+            if item.peak_rss_bytes is None or peak > item.peak_rss_bytes:
+                item.peak_rss_bytes = peak
 
     def _update_job(
         self,

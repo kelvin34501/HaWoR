@@ -29,6 +29,9 @@ export HAWOR_CLEANUP_INTERMEDIATE=true
 export HAWOR_CLEANUP_FAILED_CACHE=false
 export HAWOR_COPY_EXTRACTED_IMAGES=false
 export HAWOR_RUN_VISUALIZATIONS=false
+export HAWOR_NUM_THREADS=1
+export HAWOR_DECORD_NUM_THREADS=1
+export HAWOR_DECORD_RECYCLE_AFTER=64
 export HAWOR_S3MOUNT_BIN=/mnt/petrelfs/share_data/s3mount
 export HAWOR_MOUNT_ROOT=/mnt/oss
 export HAWOR_MOUNT_READY_TIMEOUT=30
@@ -45,6 +48,9 @@ Common startup options:
 - `--cleanup-failed-cache`: delete failed job cache directories instead of preserving them for debugging.
 - `--copy-extracted-images` / `--no-copy-extracted-images`: **deprecated no-op.** Frames are now decoded on demand from the video (`FrameSource`) and are never written to disk, so there are no `extracted_images`/`extracted_images_50fps` directories to copy. The flag (and `HAWOR_COPY_EXTRACTED_IMAGES`) is still accepted but has no effect.
 - `--run-visualizations` / `--no-run-visualizations` (`HAWOR_RUN_VISUALIZATIONS`): render the cam-space/world-space visualization videos (`cam_space_visualization_*fps.mp4`, `world_space_visualization_*fps.mp4`) after processing each video (default `false`).
+- `HAWOR_NUM_THREADS`: CPU inference-pool threads per video subprocess (service-child default `1`; an explicit operator value is preserved).
+- `--decord-num-threads` (`HAWOR_DECORD_NUM_THREADS`): Decord threads per video process (default `1`). Values must be positive.
+- `--decord-recycle-after` (`HAWOR_DECORD_RECYCLE_AFTER`): decoded frames per native reader before it is released and reopened (default `64`). Values must be positive.
 - `--s3mount-bin`: path to the `s3mount` binary (default `s3mount` on `PATH`).
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).
@@ -97,7 +103,8 @@ curl -X POST http://127.0.0.1:8000/v1/annotate \
 
 `GET /healthz`
 
-Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`, and `mount_ready_timeout`.
+Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`,
+`mount_ready_timeout`, `decord_num_threads`, and `decord_recycle_after`.
 
 ## Current Behavior
 
@@ -108,6 +115,7 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`, and
 - Status values are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED`, and item-level `SKIPPED`.
 - `progress` is reported as an integer percentage from `0` to `100`.
 - Progress fields include `videos_total`, `videos_done`, `videos_failed`, `videos_skipped`, `progress`, and the job-level `stage` field.
+- Every video item reports `peak_rss_bytes`, the sampled peak of its processing subprocess tree. The same value and a pass/fail result against the 15 GiB acceptance threshold are appended to `process.log`; over-budget jobs are reported, not killed.
 - Intermediate cache is organized under `<cache_dir>/<job_id>/<video_stem>/`.
 - Successful jobs clean cache by default; failed or canceled jobs are kept by default for debugging.
 - Environment variables use the same semantics as the service config: `HAWOR_CLEANUP_INTERMEDIATE` and `HAWOR_CLEANUP_FAILED_CACHE`.

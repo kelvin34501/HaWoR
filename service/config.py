@@ -24,6 +24,8 @@ class ServiceConfig:
     jobs_per_gpu: int = 1
     copy_extracted_images: bool = True
     run_visualizations: bool = False
+    decord_num_threads: int = 1
+    decord_recycle_after: int = 64
 
 
 def load_service_config(
@@ -41,6 +43,8 @@ def load_service_config(
     s3mount_bin: Optional[str] = None,
     mount_root: Optional[Union[str, Path]] = None,
     mount_ready_timeout: Optional[float] = None,
+    decord_num_threads: Optional[int] = None,
+    decord_recycle_after: Optional[int] = None,
 ) -> ServiceConfig:
     resolved_cache_dir = Path(cache_dir or os.getenv("HAWOR_CACHE_DIR", ".hawor_cache")).expanduser().resolve()
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +81,19 @@ def load_service_config(
     if resolved_jobs_per_gpu < 1:
         raise ValueError("jobs_per_gpu must be >= 1")
 
+    resolved_decord_num_threads = _positive_int_setting(
+        decord_num_threads,
+        env_name="HAWOR_DECORD_NUM_THREADS",
+        default=1,
+        setting_name="decord_num_threads",
+    )
+    resolved_decord_recycle_after = _positive_int_setting(
+        decord_recycle_after,
+        env_name="HAWOR_DECORD_RECYCLE_AFTER",
+        default=64,
+        setting_name="decord_recycle_after",
+    )
+
     return ServiceConfig(
         cache_dir=resolved_cache_dir,
         gpu_ids=gpu_ids or os.getenv("HAWOR_GPU_IDS", "0"),
@@ -95,6 +112,8 @@ def load_service_config(
             "HAWOR_COPY_EXTRACTED_IMAGES", default=True)),
         run_visualizations=(run_visualizations if run_visualizations is not None else _parse_bool_env(
             "HAWOR_RUN_VISUALIZATIONS", default=False)),
+        decord_num_threads=resolved_decord_num_threads,
+        decord_recycle_after=resolved_decord_recycle_after,
     )
 
 
@@ -109,6 +128,25 @@ def _parse_bool_env(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean value for {name}: {raw_value}")
+
+
+def _positive_int_setting(
+    explicit_value: Optional[int],
+    *,
+    env_name: str,
+    default: int,
+    setting_name: str,
+) -> int:
+    raw_value = explicit_value
+    if raw_value is None:
+        raw_value = os.getenv(env_name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{setting_name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{setting_name} must be a positive integer")
+    return value
 
 
 def _assert_writable_directory(path: Path) -> None:

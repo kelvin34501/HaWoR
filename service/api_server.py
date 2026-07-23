@@ -58,6 +58,8 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
             "mount_root": str(config.mount_root),
             "mount_ready_timeout": config.mount_ready_timeout,
             "run_visualizations": config.run_visualizations,
+            "decord_num_threads": config.decord_num_threads,
+            "decord_recycle_after": config.decord_recycle_after,
         }
 
     @app.post("/v1/annotate", status_code=202)
@@ -117,6 +119,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--gpu-ids", default=None, help='GPU pool, e.g. "0" or "0,1"')
     parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument(
+        "--decord-num-threads",
+        type=int,
+        default=None,
+        help="Decoder threads per video process (default 1; also HAWOR_DECORD_NUM_THREADS)",
+    )
+    parser.add_argument(
+        "--decord-recycle-after",
+        type=int,
+        default=None,
+        help="Decoded frames before reopening Decord (default 64; also "
+             "HAWOR_DECORD_RECYCLE_AFTER)",
+    )
     parser.add_argument("--s3mount-bin", default=None, help="Path to the s3mount binary")
     parser.add_argument("--mount-root", default=None, help="Root directory for per-job bucket mounts")
     parser.add_argument("--mount-ready-timeout",
@@ -166,6 +181,8 @@ def main() -> None:
         s3mount_bin=args.s3mount_bin,
         mount_root=args.mount_root,
         mount_ready_timeout=args.mount_ready_timeout,
+        decord_num_threads=args.decord_num_threads,
+        decord_recycle_after=args.decord_recycle_after,
     )
     uvicorn.run(create_app(config), host=config.host, port=config.port)
 

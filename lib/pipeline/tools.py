@@ -1,3 +1,6 @@
+import ctypes
+import ctypes.util
+import gc
 import os
 import cv2
 import joblib
@@ -8,6 +11,9 @@ from hawor.utils.process import run_mano, run_mano_left
 
 from lib.eval_utils.custom_utils import cam_to_img, load_gt_cam
 from ultralytics import YOLO
+
+
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
 
 
 if torch.cuda.is_available():
@@ -25,6 +31,16 @@ else:
 def detect_track(imgfiles, thresh=0.5):
     
     hand_det_model = YOLO('./weights/external/detector.pt')
+    # Ultralytics retains the complete training checkpoint on the wrapper,
+    # including a second (non-EMA) DetectionModel and optimizer state. Tracking
+    # uses ``hand_det_model.model`` only, so release the duplicate checkpoint
+    # before Decord begins allocating 4K decode buffers.
+    hand_det_model.ckpt = None
+    gc.collect()
+    try:
+        _LIBC.malloc_trim(0)
+    except AttributeError:
+        pass
 
     # Run
     boxes_ = []

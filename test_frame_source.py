@@ -126,5 +126,8 @@ if __name__ == "__main__":
         # nested sub-indexing must stay consistent too
         sub2 = sub[1:3]
         assert np.array_equal(sub2[0], rs[picks[1]]) and np.array_equal(sub2[1], rs[picks[2]])
+        batch = rs.get_batch(picks)
+        for k, v in enumerate(picks):
+            assert np.array_equal(batch[k], rs[v]), f"batch index {v} != integer index {v}"
     print("[fancy-index] OK")
     print("ALL FRAME SOURCE CHECKS PASSED")

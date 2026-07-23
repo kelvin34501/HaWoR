@@ -28,11 +28,16 @@ expect RGB.
 fork safety
 -----------
 decord ``VideoReader`` objects are not fork-safe and must not be shared across
-processes. The reader is opened lazily and cached per ``os.getpid()`` so DataLoader
-workers and subprocesses each get their own.
+processes. The reader is opened lazily, discarded immediately in a forked child,
+and never serialized into a spawned worker.
 """
 
+import gc
 import os
+import threading
+import weakref
+import ctypes
+import ctypes.util
 from glob import glob
 
 import cv2
@@ -41,6 +46,39 @@ from natsort import natsorted
 
 
 _IMAGE_EXTS = ("*.jpg", "*.jpeg", "*.png")
+_DEFAULT_DECORD_NUM_THREADS = 1
+_DEFAULT_DECORD_RECYCLE_AFTER = 64
+_DECORD_READ_AHEAD_FLUSH_AFTER = 16
+
+# Decord readers own native decoder threads and frame buffers. Keep exactly one
+# active reader in a process even when callers construct several FrameSource
+# instances (for example, the interpolation stage probes both 30 fps and 50 fps
+# timelines). Opening a reader through one source releases the previous source's
+# reader; it will reopen transparently if used again.
+_ACTIVE_READER_LOCK = threading.RLock()
+_ACTIVE_READER_PID = None
+_ACTIVE_READER_OWNER = None
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+
+def _discard_active_reader_after_fork():
+    """Forget native state inherited into a forked child.
+
+    Reinitialize the lock without acquiring the inherited instance: another
+    parent thread may have held it at fork time.
+    """
+    global _ACTIVE_READER_LOCK, _ACTIVE_READER_PID, _ACTIVE_READER_OWNER
+    owner_ref = _ACTIVE_READER_OWNER
+    _ACTIVE_READER_LOCK = threading.RLock()
+    _ACTIVE_READER_PID = None
+    _ACTIVE_READER_OWNER = None
+    owner = owner_ref() if owner_ref is not None else None
+    if owner is not None:
+        owner._drop_reader(unregister=False)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_discard_active_reader_after_fork)
 
 
 def _is_video_path(source):
@@ -104,29 +142,39 @@ class FrameSource:
     """
 
     def __init__(self, source, target_fps=30, start=0, end=None, color="bgr",
-                 num_threads=None, recycle_after=512):
+                 num_threads=None, recycle_after=None):
         assert color in ("bgr", "rgb"), color
         self.color = color
         self.target_fps = float(target_fps)
         # decord defaults num_threads=0 -> one decode thread per CPU core, each
         # with its own frame buffers; on a many-core node that alone balloons RAM.
-        # Cap it (env override for the service). See _reader().
+        # One thread was the best bounded-memory setting in the 4K loader probe.
         if num_threads is None:
-            num_threads = int(os.environ.get("HAWOR_DECORD_NUM_THREADS", 2))
-        self.num_threads = max(1, int(num_threads))
+            num_threads = os.environ.get(
+                "HAWOR_DECORD_NUM_THREADS", str(_DEFAULT_DECORD_NUM_THREADS)
+            )
+        self.num_threads = _positive_int(num_threads, "num_threads")
         # Flush interval: drop & reopen the decord reader after this many decoded
         # frames so its internal decode/seek buffers can't grow without bound.
-        # ~6 recycles over a max ~3000-frame chunk. 0 disables.
-        self.recycle_after = int(recycle_after)
-        self._readers = {}  # pid -> decord.VideoReader
-        self._reads = {}    # pid -> frames decoded since this reader was (re)opened
+        if recycle_after is None:
+            recycle_after = os.environ.get(
+                "HAWOR_DECORD_RECYCLE_AFTER", str(_DEFAULT_DECORD_RECYCLE_AFTER)
+            )
+        self.recycle_after = _positive_int(recycle_after, "recycle_after")
+        self._video_reader = None
+        self._reader_pid = None
+        self._reads = 0
         self._frame_shape = None
 
         if _is_video_path(source):
             self._mode = "video"
             self.video_path = source
             self._paths = None
-            index_map = self._build_video_index_map()
+            try:
+                index_map = self._build_video_index_map()
+            except BaseException:
+                self.close()
+                raise
         else:
             self._mode = "images"
             self.video_path = None
@@ -148,17 +196,35 @@ class FrameSource:
 
     # ------------------------------------------------------------------ readers
     def _reader(self):
+        global _ACTIVE_READER_PID, _ACTIVE_READER_OWNER
         pid = os.getpid()
-        reader = self._readers.get(pid)
-        if reader is None:
+        if self._reader_pid is not None and self._reader_pid != pid:
+            self._drop_reader()
+        if self._video_reader is not None:
+            return self._video_reader
+
+        with _ACTIVE_READER_LOCK:
+            owner = None
+            if _ACTIVE_READER_PID == pid and _ACTIVE_READER_OWNER is not None:
+                owner = _ACTIVE_READER_OWNER()
+            if owner is not None and owner is not self:
+                owner._drop_reader(unregister=False)
+
             import decord
 
-            reader = decord.VideoReader(
-                self.video_path, ctx=decord.cpu(0), num_threads=self.num_threads
-            )
-            self._readers[pid] = reader
-            self._reads[pid] = 0
-        return reader
+            try:
+                reader = decord.VideoReader(
+                    self.video_path, ctx=decord.cpu(0), num_threads=self.num_threads
+                )
+            except BaseException:
+                self._drop_reader()
+                raise
+            self._video_reader = reader
+            self._reader_pid = pid
+            self._reads = 0
+            _ACTIVE_READER_PID = pid
+            _ACTIVE_READER_OWNER = weakref.ref(self)
+            return reader
 
     def _count_reads(self, n):
         """Track decoded frames and recycle the reader once the cap is hit.
@@ -167,17 +233,39 @@ class FrameSource:
         object; over a long chunk this grows steadily. Dropping the reader
         releases those buffers -- the next frame access reopens it transparently.
         """
-        pid = os.getpid()
-        self._reads[pid] = self._reads.get(pid, 0) + int(n)
-        if self.recycle_after and self._reads[pid] >= self.recycle_after:
-            self._drop_reader(pid)
+        self._reads += int(n)
+        if self._reads >= self.recycle_after:
+            self._drop_reader()
 
-    def _drop_reader(self, pid=None):
-        """Release the reader for ``pid`` (default current). Last ref -> decord
-        frees its native buffers on GC. Non-destructive: reopened on next read."""
-        pid = os.getpid() if pid is None else pid
-        self._readers.pop(pid, None)
-        self._reads.pop(pid, None)
+    def _drop_reader(self, *, unregister=True):
+        """Release this source's reader and its native buffers immediately."""
+        global _ACTIVE_READER_PID, _ACTIVE_READER_OWNER
+        reader = self._video_reader
+        self._video_reader = None
+        self._reader_pid = None
+        self._reads = 0
+
+        if unregister:
+            with _ACTIVE_READER_LOCK:
+                owner = _ACTIVE_READER_OWNER() if _ACTIVE_READER_OWNER is not None else None
+                if owner is self:
+                    _ACTIVE_READER_PID = None
+                    _ACTIVE_READER_OWNER = None
+
+        # CPython destroys the native VideoReader when its final reference is
+        # deleted. Clear our state first so exceptions from native finalization
+        # cannot leave a stale reader registered.
+        had_reader = reader is not None
+        del reader
+        if had_reader:
+            # Decord's Python/native wrapper can participate in reference cycles
+            # through callbacks. Collect at the lifecycle boundary so recycle and
+            # close have deterministic native-memory semantics.
+            gc.collect()
+            try:
+                _LIBC.malloc_trim(0)
+            except AttributeError:
+                pass
 
     def close(self):
         """Release all cached decord readers (safe to call repeatedly).
@@ -185,8 +273,7 @@ class FrameSource:
         Non-destructive: a subsequent frame access reopens the reader lazily, so
         callers use this to free decoder memory between pipeline stages.
         """
-        self._readers.clear()
-        self._reads.clear()
+        self._drop_reader()
 
     def __enter__(self):
         return self
@@ -200,16 +287,28 @@ class FrameSource:
         except Exception:
             pass
 
-    def _build_video_index_map(self):
-        reader = self._reader()
-        n_native = len(reader)
-        if n_native == 0:
-            return np.zeros(0, dtype=np.int64)
+    def __getstate__(self):
+        """Never serialize a native reader into a spawned worker."""
+        state = self.__dict__.copy()
+        state["_video_reader"] = None
+        state["_reader_pid"] = None
+        state["_reads"] = 0
+        return state
 
-        try:
-            native_fps = float(reader.get_avg_fps())
-        except Exception:
-            native_fps = self.target_fps
+    def _build_video_index_map(self):
+        with _ACTIVE_READER_LOCK:
+            reader = self._reader()
+            try:
+                n_native = len(reader)
+                if n_native == 0:
+                    return np.zeros(0, dtype=np.int64)
+                try:
+                    native_fps = float(reader.get_avg_fps())
+                except Exception:
+                    native_fps = self.target_fps
+            except BaseException:
+                self._drop_reader()
+                raise
         if not native_fps or native_fps <= 0:
             native_fps = self.target_fps
 
@@ -243,10 +342,21 @@ class FrameSource:
             if self.color == "rgb":
                 img = img[:, :, ::-1]
             return np.ascontiguousarray(img)
-        frame = self._reader()[native_idx].asnumpy()  # RGB HWC uint8
-        out = self._to_color(frame)
-        self._count_reads(1)
-        return out
+        with _ACTIVE_READER_LOCK:
+            try:
+                frame = self._reader()[native_idx].asnumpy()  # RGB HWC uint8
+                out = self._to_color(frame)
+                # Slow inference lets Decord's background queue fill with 4K
+                # frames even though the reader itself is recycled at 64. A
+                # periodic cursor reset flushes that read-ahead without replacing
+                # the reader or changing the decoded-frame lifecycle.
+                if (self._reads + 1) % _DECORD_READ_AHEAD_FLUSH_AFTER == 0:
+                    self._video_reader.seek(0)
+                self._count_reads(1)
+                return out
+            except BaseException:
+                self._drop_reader()
+                raise
 
     def __len__(self):
         return len(self._index_map)
@@ -273,12 +383,34 @@ class FrameSource:
         native = self._index_map[indices]
         if self._mode == "images":
             return np.stack([self._read_native(int(n)) for n in native], axis=0)
-        frames = self._reader().get_batch(native.tolist()).asnumpy()  # N,H,W,3 RGB
-        if self.color == "bgr":
-            frames = frames[:, :, :, ::-1]
-        out = np.ascontiguousarray(frames)
-        self._count_reads(len(native))
-        return out
+
+        # A caller can request more than one recycle interval in a single batch.
+        # Split it so no native reader decodes more than recycle_after frames.
+        chunks = []
+        offset = 0
+        while offset < len(native):
+            with _ACTIVE_READER_LOCK:
+                remaining = self.recycle_after - self._reads
+                chunk_native = native[offset:offset + remaining]
+                try:
+                    frames = self._reader().get_batch(chunk_native.tolist()).asnumpy()
+                    if self.color == "bgr":
+                        frames = frames[:, :, :, ::-1]
+                    chunks.append(np.ascontiguousarray(frames))
+                    # Batch data has been copied into NumPy; flush background
+                    # read-ahead before the caller begins model inference.
+                    self._video_reader.seek(0)
+                    self._count_reads(len(chunk_native))
+                    offset += len(chunk_native)
+                except BaseException:
+                    self._drop_reader()
+                    raise
+
+        if not chunks:
+            return np.empty((0, *self.frame_shape, 3), dtype=np.uint8)
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks, axis=0)
 
     def __iter__(self):
         for i in range(len(self)):
@@ -295,9 +427,18 @@ class FrameSource:
         return self._frame_shape
 
 
-def make_frame_source(source, target_fps=30, start=0, end=None, color="bgr"):
+def make_frame_source(source, target_fps=30, start=0, end=None, color="bgr",
+                      num_threads=None, recycle_after=None):
     """Convenience factory mirroring the :class:`FrameSource` constructor."""
-    return FrameSource(source, target_fps=target_fps, start=start, end=end, color=color)
+    return FrameSource(
+        source,
+        target_fps=target_fps,
+        start=start,
+        end=end,
+        color=color,
+        num_threads=num_threads,
+        recycle_after=recycle_after,
+    )
 
 
 def frame_source_from_args(args, color="bgr"):
@@ -314,4 +455,16 @@ def frame_source_from_args(args, color="bgr"):
         start=getattr(args, "frame_start", None) or 0,
         end=getattr(args, "frame_end", None),
         color=color,
+        num_threads=getattr(args, "decord_num_threads", None),
+        recycle_after=getattr(args, "decord_recycle_after", None),
     )
+
+
+def _positive_int(value, name):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed

@@ -17,11 +17,33 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional, Sequence, Union
+from typing import Callable, Iterator, Optional, Sequence, Union
 
 from service.storage import PROCESS_DONE_FILENAME
 
 GpuIds = Union[str, Sequence[Union[int, str]]]
+PEAK_RSS_ACCEPTANCE_BYTES = 15 * 1024 ** 3
+_RSS_SAMPLE_INTERVAL_SECONDS = 0.05
+_PAGE_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
+
+
+class _PeakRssTracker:
+
+    def __init__(self, callback: Optional[Callable[[int], None]] = None) -> None:
+        self.peak_rss_bytes = 0
+        self._callback = callback
+
+    def observe(self, rss_bytes: int) -> None:
+        rss_bytes = max(0, int(rss_bytes))
+        if rss_bytes <= self.peak_rss_bytes:
+            return
+        self.peak_rss_bytes = rss_bytes
+        if self._callback is not None:
+            try:
+                self._callback(rss_bytes)
+            except Exception:
+                # Telemetry delivery must never terminate an annotation process.
+                pass
 
 
 @dataclass(frozen=True)
@@ -39,6 +61,7 @@ class HaWoRProcessResult:
     world_space_res_50fps_path: Optional[Path]
     cam_space_vis_path: Optional[Path]
     world_space_vis_path: Optional[Path]
+    peak_rss_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +85,8 @@ class HaWoRProcessorConfig:
     # Frames are decoded on demand from the video; nothing is extracted to disk, so
     # this flag is accepted for API compatibility but has no effect.
     copy_extracted_images: bool = True
+    decord_num_threads: int = 1
+    decord_recycle_after: int = 64
 
 
 class GpuPool:
@@ -116,6 +141,7 @@ class HaWoRVideoProcessorForService:
         scratch_dir: Union[str, Path],
         overwrite_output: bool = False,
         clear_on_overwrite: bool = True,
+        peak_rss_callback: Optional[Callable[[int], None]] = None,
     ) -> HaWoRProcessResult:
         """Process a single video.
 
@@ -127,6 +153,7 @@ class HaWoRVideoProcessorForService:
         video = Path(video_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
         scratch_root = Path(scratch_dir).expanduser().resolve()
+        peak_rss = _PeakRssTracker(peak_rss_callback)
 
         if not video.is_file():
             raise FileNotFoundError(f"Video file not found: {video}")
@@ -146,7 +173,9 @@ class HaWoRVideoProcessorForService:
         with self.gpu_pool.acquire() as gpu_id:
             env = self._build_env(gpu_id)
             try:
-                self._run_segmented_pipeline(video, work_dir, live_log_path, gpu_id, env)
+                self._run_segmented_pipeline(
+                    video, work_dir, live_log_path, gpu_id, env, peak_rss
+                )
                 self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
                 if self.config.cleanup_intermediate and work_dir.exists():
                     shutil.rmtree(work_dir)
@@ -155,23 +184,27 @@ class HaWoRVideoProcessorForService:
                 # Runs on the staged dir before interpolation so it flows to out_dir
                 # with the staged copy and the 50fps step can interpolate it too.
                 if self.config.run_world_space:
-                    self._build_world_space_res(staged_output_dir, video, live_log_path, env)
+                    self._build_world_space_res(
+                        staged_output_dir, video, live_log_path, env, peak_rss
+                    )
 
                 # Frames are never extracted to disk; the 50fps interpolation derives
                 # its frame count directly from the video.
                 extracted_images_50fps_dir: Optional[Path] = None
                 if self.config.run_post_steps or self.config.force_interpolate:
-                    self._run_interpolation(staged_output_dir, video, live_log_path, env)
+                    self._run_interpolation(
+                        staged_output_dir, video, live_log_path, env, peak_rss
+                    )
 
                 cam_space_vis_path: Optional[Path] = None
                 world_space_vis_path: Optional[Path] = None
                 if self.config.run_visualizations:
                     staged_cam_space_vis_path = self._run_cam_space_visualization(
-                        staged_output_dir, video, live_log_path, env)
+                        staged_output_dir, video, live_log_path, env, peak_rss)
                     cam_space_vis_path = out_dir / staged_cam_space_vis_path.name
                     if self.config.run_world_space:
                         staged_world_space_vis_path = self._run_world_space_visualization(
-                            staged_output_dir, video, live_log_path, env)
+                            staged_output_dir, video, live_log_path, env, peak_rss)
                         world_space_vis_path = out_dir / staged_world_space_vis_path.name
 
                 if not self.config.cleanup_intermediate:
@@ -183,6 +216,7 @@ class HaWoRVideoProcessorForService:
                                               overwrite_output=overwrite_output)
                 self._write_done_sentinel(out_dir, scratch_root)
             finally:
+                self._write_peak_rss_summary(live_log_path, peak_rss.peak_rss_bytes)
                 self._publish_log(live_log_path, log_path)
 
             if self.config.cleanup_intermediate and scratch_root.exists():
@@ -205,6 +239,7 @@ class HaWoRVideoProcessorForService:
                                             if self.config.run_world_space else None),
                 cam_space_vis_path=cam_space_vis_path,
                 world_space_vis_path=world_space_vis_path,
+                peak_rss_bytes=peak_rss.peak_rss_bytes,
             )
 
     def _validate_config(self) -> None:
@@ -214,6 +249,10 @@ class HaWoRVideoProcessorForService:
             raise ValueError("min_last_segment_seconds must be non-negative")
         if self.config.max_chunk_frames < 2:
             raise ValueError("max_chunk_frames must be >= 2")
+        if self.config.decord_num_threads < 1:
+            raise ValueError("decord_num_threads must be >= 1")
+        if self.config.decord_recycle_after < 1:
+            raise ValueError("decord_recycle_after must be >= 1")
         if self.config.overlap_policy not in {"keep_last", "keep_first"}:
             raise ValueError("overlap_policy must be 'keep_last' or 'keep_first'")
         if shutil.which(sys.executable) is None:
@@ -224,6 +263,12 @@ class HaWoRVideoProcessorForService:
     def _build_env(self, gpu_id: int) -> dict[str, str]:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Forty concurrent jobs do not need eight CPU inference pools apiece.
+        # One thread also keeps PyTorch/OpenCV allocator overhead below the 15 GiB
+        # process-tree gate. Preserve an explicit operator override.
+        env.setdefault("HAWOR_NUM_THREADS", "1")
+        env["HAWOR_DECORD_NUM_THREADS"] = str(self.config.decord_num_threads)
+        env["HAWOR_DECORD_RECYCLE_AFTER"] = str(self.config.decord_recycle_after)
         return env
 
     def _run_segmented_pipeline(
@@ -233,6 +278,7 @@ class HaWoRVideoProcessorForService:
         log_path: Path,
         gpu_id: int,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> None:
         script = self.config.project_dir / "scripts" / "segmented_demo_pipeline.py"
         cmd = [
@@ -259,7 +305,7 @@ class HaWoRVideoProcessorForService:
         ]
         cmd.append("--skip_copy_back")
 
-        self._run_command(cmd, log_path, env)
+        self._run_command(cmd, log_path, env, peak_rss)
 
     def _copy_directory_contents(
             self,
@@ -383,6 +429,7 @@ class HaWoRVideoProcessorForService:
         video: Path,
         log_path: Path,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> None:
         script = self.config.project_dir / "scripts" / "build_world_space_res.py"
         cmd = [
@@ -397,7 +444,7 @@ class HaWoRVideoProcessorForService:
             "--target_fps",
             str(self.config.target_fps),
         ]
-        self._run_command(cmd, log_path, env)
+        self._run_command(cmd, log_path, env, peak_rss)
 
     def _run_cam_space_visualization(
         self,
@@ -405,6 +452,7 @@ class HaWoRVideoProcessorForService:
         video: Path,
         log_path: Path,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> Path:
         script = self.config.project_dir / "scripts" / "visualize_reconstructed_video.py"
         cam_space_dir = seq_dir / "cam_space_50fps"
@@ -427,7 +475,7 @@ class HaWoRVideoProcessorForService:
             "--fps",
             str(render_fps),
         ]
-        self._run_command(cmd, log_path, env)
+        self._run_command(cmd, log_path, env, peak_rss)
         return output_path
 
     def _run_world_space_visualization(
@@ -436,6 +484,7 @@ class HaWoRVideoProcessorForService:
         video: Path,
         log_path: Path,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> Path:
         script = self.config.project_dir / "scripts" / "visualize_world_reconstructed_video.py"
         world_space_res_50fps = seq_dir / "world_space_res_50fps.pth"
@@ -472,7 +521,7 @@ class HaWoRVideoProcessorForService:
             "--fps",
             str(render_fps),
         ]
-        self._run_command(cmd, log_path, env)
+        self._run_command(cmd, log_path, env, peak_rss)
         return output_path
 
     def _find_visualization_slam_npz(self, seq_dir: Path, *, prefer_50fps: bool) -> Path:
@@ -496,6 +545,7 @@ class HaWoRVideoProcessorForService:
         video: Path,
         log_path: Path,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> None:
         script = self.config.project_dir / "scripts" / "interpolation.py"
         cmd = [
@@ -510,13 +560,14 @@ class HaWoRVideoProcessorForService:
             "--target_fps",
             str(self.config.interp_target_fps),
         ]
-        self._run_command(cmd, log_path, env)
+        self._run_command(cmd, log_path, env, peak_rss)
 
     def _run_command(
         self,
         cmd: Sequence[str],
         log_path: Path,
         env: dict[str, str],
+        peak_rss: _PeakRssTracker,
     ) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with self._log_lock:
@@ -524,8 +575,9 @@ class HaWoRVideoProcessorForService:
                 log.write(f"\n$ {' '.join(cmd)}\n")
                 log.flush()
 
+        command_peak_rss_bytes = 0
         with log_path.open("a", encoding="utf-8") as log:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 list(cmd),
                 cwd=self.config.project_dir,
                 env=env,
@@ -533,9 +585,82 @@ class HaWoRVideoProcessorForService:
                 stderr=subprocess.STDOUT,
                 text=True,
             )
+            while True:
+                rss_bytes = _read_process_tree_rss_bytes(proc.pid)
+                command_peak_rss_bytes = max(command_peak_rss_bytes, rss_bytes)
+                peak_rss.observe(rss_bytes)
+                try:
+                    returncode = proc.wait(timeout=_RSS_SAMPLE_INTERVAL_SECONDS)
+                except subprocess.TimeoutExpired:
+                    continue
+                # Capture one final sample in case the root is still represented
+                # in /proc while wait() reaps it.
+                rss_bytes = _read_process_tree_rss_bytes(proc.pid)
+                command_peak_rss_bytes = max(command_peak_rss_bytes, rss_bytes)
+                peak_rss.observe(rss_bytes)
+                break
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"Command failed with exit code {proc.returncode}. See log: {log_path}")
+        with self._log_lock:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    "[memory] command_peak_rss_bytes="
+                    f"{command_peak_rss_bytes} video_peak_rss_bytes="
+                    f"{peak_rss.peak_rss_bytes}\n"
+                )
+
+        if returncode != 0:
+            raise RuntimeError(f"Command failed with exit code {returncode}. See log: {log_path}")
+
+    def _write_peak_rss_summary(self, log_path: Path, peak_rss_bytes: int) -> None:
+        within_limit = peak_rss_bytes < PEAK_RSS_ACCEPTANCE_BYTES
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    "[memory] peak_rss_bytes="
+                    f"{peak_rss_bytes} peak_rss_gib={peak_rss_bytes / 1024 ** 3:.3f} "
+                    f"acceptance_threshold_bytes={PEAK_RSS_ACCEPTANCE_BYTES} "
+                    f"acceptance={'PASS' if within_limit else 'FAIL'}\n"
+                )
+
+
+def _read_process_tree_rss_bytes(root_pid: int) -> int:
+    """Return conservative summed RSS for a Linux process and its descendants.
+
+    The service runs on Linux GPU hosts, where procfs provides both resident-page
+    counts and per-thread child lists. Processes can appear or exit while the tree
+    is sampled; those races are expected and the next 50 ms sample catches the
+    surviving tree.
+    """
+    total_rss_bytes = 0
+    pending = [int(root_pid)]
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+
+        proc_dir = Path("/proc") / str(pid)
+        try:
+            statm_fields = (proc_dir / "statm").read_text().split()
+            if len(statm_fields) >= 2:
+                total_rss_bytes += int(statm_fields[1]) * _PAGE_SIZE_BYTES
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+            continue
+
+        # A multithreaded process may fork from any thread, so aggregate every
+        # task's children file rather than inspecting only the thread-group leader.
+        try:
+            child_files = tuple((proc_dir / "task").glob("*/children"))
+        except (FileNotFoundError, PermissionError, OSError):
+            child_files = ()
+        for child_file in child_files:
+            try:
+                pending.extend(int(value) for value in child_file.read_text().split())
+            except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, OSError):
+                continue
+    return total_rss_bytes
 
 
 def _parse_gpu_ids(gpu_ids: GpuIds) -> list[int]:
