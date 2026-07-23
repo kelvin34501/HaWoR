@@ -16,11 +16,20 @@ from service.s3mount_manager import BucketBusyError, MountError
 class AnnotateRequest(BaseModel):
     input_url: str = Field(
         ...,
-        description="s3://bucket/path link to the directory of input videos to mount",
+        description="s3://bucket/path or a local directory containing input videos",
     )
-    endpoint: str = Field(..., description="Object-storage endpoint URL")
-    access_key: str = Field(..., description="Access key id (sensitive, never logged)")
-    secret_key: str = Field(..., description="Secret access key (sensitive, never logged)")
+    endpoint: Optional[str] = Field(
+        default=None,
+        description="Object-storage endpoint URL; required only for s3:// input_url",
+    )
+    access_key: Optional[str] = Field(
+        default=None,
+        description="Access key id; required only for s3:// input_url",
+    )
+    secret_key: Optional[str] = Field(
+        default=None,
+        description="Secret access key; required only for s3:// input_url and never logged",
+    )
     region: Optional[str] = Field(default=None, description="Optional region (e.g. oss-cn-beijing)")
     force_path_style: bool = Field(default=False, description="Set for endpoints requiring path-style S3 requests")
     use_listobject_v2: bool = Field(default=False, description="Set for backends requiring ListObjectsV2")

@@ -1,6 +1,6 @@
 # HaWoR Folder Annotation Service
 
-This service adds folder-level batch annotation on top of the existing single-video HaWoR pipeline. It mounts the bucket/prefix from `input_url` per request on demand, scans the top level of that mounted prefix, creates one job, dispatches videos across the configured GPU pool, writes intermediate files into `cache_dir`, writes final outputs to `annotations/<video_stem>/` under the input prefix, and unmounts when the job finishes.
+This service adds folder-level batch annotation on top of the existing single-video HaWoR pipeline. `input_url` may be either an `s3://bucket/prefix` mounted on demand or a directory on the API server's local filesystem. The service scans the top level of that directory, dispatches videos across the configured GPU pool, writes intermediate files into `cache_dir`, and writes final outputs to `annotations/<video_stem>/` under the input directory.
 
 ## Install
 
@@ -55,7 +55,7 @@ Common startup options:
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).
 
-The service mounts one object-storage bucket per job on demand:
+For S3 input, the service mounts one object-storage bucket per job on demand:
 
 - Each `POST /v1/annotate` carries `input_url` (`s3://bucket/prefix`) plus endpoint, access/secret keys, optional region, and mount flags.
 - The requested bucket/prefix is mounted at `<mount-root>/<job_id>/video_in` using `s3mount`, and the mount is removed when the job reaches a terminal state.
@@ -63,6 +63,15 @@ The service mounts one object-storage bucket per job on demand:
 - Access/secret keys are passed only to the `s3mount` child process environment; they are never logged or echoed back.
 - A bucket already in use by another active job is rejected with `409`.
 - Native `s3://...` filesystem paths are not used internally; the public API accepts `s3://...` only through `input_url`.
+
+For local input, set `input_url` to a directory path visible to the API server.
+S3 credentials and mount options may be omitted. The service does not copy or
+mount the directory and writes results directly to its `annotations/` child.
+Relative paths resolve from the API server's working directory. The API process
+must have read/execute access to the input directory and write access to it for
+creating results. Exposing local paths allows API clients to access directories
+available to the service account, so the endpoint should only be used by trusted
+clients.
 
 ## API
 
@@ -81,6 +90,19 @@ curl -X POST http://127.0.0.1:8000/v1/annotate \
     "region": null,
     "force_path_style": false,
     "use_listobject_v2": false,
+    "vis_mode": "off",
+    "overwrite": false,
+    "skip_processed": false
+  }'
+```
+
+Local-directory request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/annotate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input_url": "/data/videos/batch_01",
     "vis_mode": "off",
     "overwrite": false,
     "skip_processed": false
@@ -108,9 +130,9 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`,
 
 ## Current Behavior
 
-- Only scans the top level of the `input_url` prefix; no recursive scan.
-- Outputs always go to `annotations/<video_stem>/` under the same mounted input prefix.
-- The request supports `input_url`, `endpoint`, access/secret keys, `region`, `force_path_style`, `use_listobject_v2`, `vis_mode`, `overwrite`, and `skip_processed`.
+- Only scans the top level of the `input_url` directory or prefix; no recursive scan.
+- Outputs always go to `annotations/<video_stem>/` under the same input directory.
+- `input_url` accepts an `s3://bucket/prefix` or a local directory. `endpoint`, access/secret keys, `region`, `force_path_style`, and `use_listobject_v2` apply only to S3 input.
 - `img_focal` is not exposed in this version.
 - Status values are `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELED`, and item-level `SKIPPED`.
 - `progress` is reported as an integer percentage from `0` to `100`.
@@ -119,9 +141,9 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`,
 - Intermediate cache is organized under `<cache_dir>/<job_id>/<video_stem>/`.
 - Successful jobs clean cache by default; failed or canceled jobs are kept by default for debugging.
 - Environment variables use the same semantics as the service config: `HAWOR_CLEANUP_INTERMEDIATE` and `HAWOR_CLEANUP_FAILED_CACHE`.
-- One bucket/prefix per job: input videos and `annotations/` outputs both live inside the same mounted prefix.
-- The bucket is mounted before the job starts and unmounted when the job finishes; a bucket in use by another active job is rejected.
+- For S3 jobs, input videos and `annotations/` outputs both live inside the same mounted prefix. The bucket is mounted before the job starts and unmounted when it finishes.
+- For local jobs, the input directory is used directly and no mount or unmount is performed.
 - `skip_processed=true` skips videos whose result directory already contains `process.done`.
 - Empty directories, directories without supported video files, subpaths that escape the mount, and existing result directories with `overwrite=false` are rejected before dispatch.
 
-Each completed video is written to `annotations/<video_stem>/` under the mounted input prefix. The directory contains `cam_space/`, `SLAM/`, `process.log`, `process.done`, and — when post-processing is enabled — `cam_space_50fps/` plus the interpolated 50fps SLAM artifacts. Visualization outputs are saved with the rendered FPS in the filename, for example `cam_space_visualization_50fps.mp4` / `world_space_visualization_50fps.mp4` when interpolation is available, or `cam_space_visualization_30fps.mp4` / `world_space_visualization_30fps.mp4` on the base timeline. Frames are decoded on demand and are **not** written to disk, so there are no `extracted_images*` directories.
+Each completed video is written to `annotations/<video_stem>/` under the input directory. The directory contains `cam_space/`, `SLAM/`, `process.log`, `process.done`, and — when post-processing is enabled — `cam_space_50fps/` plus the interpolated 50fps SLAM artifacts. Visualization outputs are saved with the rendered FPS in the filename, for example `cam_space_visualization_50fps.mp4` / `world_space_visualization_50fps.mp4` when interpolation is available, or `cam_space_visualization_30fps.mp4` / `world_space_visualization_30fps.mp4` on the base timeline. Frames are decoded on demand and are **not** written to disk, so there are no `extracted_images*` directories.

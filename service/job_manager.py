@@ -30,6 +30,12 @@ from service.storage import (
 JOB_OUTPUT_SUBDIR = "annotations"
 
 
+def _required_s3_value(value: Optional[str], field_name: str) -> str:
+    if value is None or not value.strip():
+        raise ValueError(f"{field_name} is required for s3:// input_url")
+    return value
+
+
 class JobNotFoundError(KeyError):
     pass
 
@@ -131,9 +137,9 @@ class JobManager:
         self,
         *,
         input_url: str,
-        endpoint: str,
-        access_key: str,
-        secret_key: str,
+        endpoint: Optional[str],
+        access_key: Optional[str],
+        secret_key: Optional[str],
         region: Optional[str],
         force_path_style: bool,
         use_listobject_v2: bool,
@@ -142,23 +148,36 @@ class JobManager:
         skip_processed: bool,
     ) -> dict[str, Any]:
         normalized_vis_mode = validate_vis_mode(vis_mode)
-        s3_url = S3Url.from_url(input_url)
-        mount_spec = MountSpec(
-            bucket=s3_url.bucket,
-            endpoint=endpoint,
-            access_key=access_key,
-            secret_key=secret_key,
-            prefix=s3_url.prefix,
-            region=region,
-            force_path_style=force_path_style,
-            use_listobject_v2=use_listobject_v2,
-            read_only=False,
-        )
+        raw_input = (input_url or "").strip()
+        if not raw_input:
+            raise ValueError("input_url must not be empty")
+        if "://" in raw_input and not raw_input.lower().startswith("s3://"):
+            raise ValueError(
+                "input_url must be an s3:// URL or a local directory path"
+            )
+
         job_id = uuid.uuid4().hex
-        mount_handle = self._mount_manager.mount(job_id, mount_spec)
+        mount_handle: Optional[MountHandle] = None
         try:
-            input_dir = mount_handle.mount_dir
-            output_dir = mount_handle.mount_dir / JOB_OUTPUT_SUBDIR
+            if raw_input.lower().startswith("s3://"):
+                s3_url = S3Url.from_url(raw_input)
+                mount_spec = MountSpec(
+                    bucket=s3_url.bucket,
+                    endpoint=_required_s3_value(endpoint, "endpoint"),
+                    access_key=_required_s3_value(access_key, "access_key"),
+                    secret_key=_required_s3_value(secret_key, "secret_key"),
+                    prefix=s3_url.prefix,
+                    region=region,
+                    force_path_style=force_path_style,
+                    use_listobject_v2=use_listobject_v2,
+                    read_only=False,
+                )
+                mount_handle = self._mount_manager.mount(job_id, mount_spec)
+                input_dir = mount_handle.mount_dir
+            else:
+                input_dir = Path(raw_input).expanduser().resolve()
+
+            output_dir = input_dir / JOB_OUTPUT_SUBDIR
             # When skip_processed=True, result dirs of already-processed videos
             # exist and would fail _validate_existing_results with overwrite=False.
             # Pass overwrite=True to bypass that upfront check; per-video processing
@@ -171,7 +190,8 @@ class JobManager:
                 s3mount_prefixes=(self.config.mount_root,),
             )
         except BaseException:
-            self._mount_manager.unmount(mount_handle)
+            if mount_handle is not None:
+                self._mount_manager.unmount(mount_handle)
             raise
 
         if skip_processed:
