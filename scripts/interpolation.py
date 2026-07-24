@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from glob import glob
 
 _IMPORT_ERROR = None
@@ -332,6 +333,28 @@ def _disps_video_path(disps_npz_path):
     return os.path.splitext(disps_npz_path)[0] + "_uint16.mkv"
 
 
+def _quantize_disps_frame(frame):
+    """Apply the legacy disparity quantization to one frame."""
+    disp = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.ascontiguousarray(
+        np.clip(
+            np.round(disp * DISPS_U16_SCALE),
+            0.0,
+            65535.0,
+        ).astype(np.uint16)
+    )
+
+
+def _write_all(stream, data):
+    """Write a contiguous array completely, including across partial writes."""
+    remaining = memoryview(data).cast("B")
+    while remaining:
+        written = stream.write(remaining)
+        if not written:
+            raise BrokenPipeError("ffmpeg stdin closed before the frame was written")
+        remaining = remaining[written:]
+
+
 def disps_npz_to_uint16_video(disps_npz_path, fps=50, overwrite=False):
     out_video = _disps_video_path(disps_npz_path)
     if (not overwrite) and os.path.exists(out_video):
@@ -343,18 +366,13 @@ def disps_npz_to_uint16_video(disps_npz_path, fps=50, overwrite=False):
         print("Skip disps video: ffmpeg not found in PATH")
         return None
 
-    data = np.load(disps_npz_path, allow_pickle=True)
-    disps = np.asarray(data["disps"], dtype=np.float32)
+    with np.load(disps_npz_path, allow_pickle=True) as data:
+        disps = np.asarray(data["disps"], dtype=np.float32)
     if disps.ndim != 3 or disps.shape[0] < 1:
         print(f"Skip disps video: invalid disps shape in {disps_npz_path} -> {disps.shape}")
         return None
 
-    # Fixed-point quantization with scale S=10000:
-    # u16 = round(disps * S), preserving sub-integer precision.
-    disp = np.nan_to_num(disps, nan=0.0, posinf=0.0, neginf=0.0)
-    disps_u16 = np.clip(np.round(disp * DISPS_U16_SCALE), 0.0, 65535.0).astype(np.uint16)
-
-    num_frames, height, width = disps_u16.shape
+    num_frames, height, width = disps.shape
     cmd = [
         ffmpeg_bin,
         "-y",
@@ -374,19 +392,34 @@ def disps_npz_to_uint16_video(disps_npz_path, fps=50, overwrite=False):
         out_video,
     ]
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        payload = np.ascontiguousarray(disps_u16).tobytes()
-        _, stderr = proc.communicate(input=payload)
-    except Exception:
-        proc.kill()
-        raise
+    # Keep the exact legacy quantization and frame order, but avoid retaining
+    # full-timeline float, uint16, and bytes copies at the same time.
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        try:
+            for frame in disps:
+                _write_all(proc.stdin, _quantize_disps_frame(frame))
+            proc.stdin.close()
+            proc.wait()
+        except Exception:
+            proc.kill()
+            proc.wait()
+            raise
 
-    if proc.returncode != 0:
-        err_msg = stderr.decode("utf-8", errors="ignore")
-        print(f"Skip disps video: ffmpeg failed for {disps_npz_path}")
-        print(err_msg)
-        return None
+        if proc.returncode != 0:
+            stderr_file.seek(0)
+            err_msg = stderr_file.read().decode("utf-8", errors="ignore")
+            print(f"Skip disps video: ffmpeg failed for {disps_npz_path}")
+            print(err_msg)
+            return None
 
     print(f"Saved uint16 disps video ({num_frames} frames, S={DISPS_U16_SCALE:g}): {out_video}")
     return out_video
