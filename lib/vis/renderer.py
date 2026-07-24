@@ -278,7 +278,7 @@ class Renderer():
             
         return image
     
-    def render_multiple(self, verts_list, faces, colors_list, cameras, lights):
+    def _render_multiple_rgba(self, verts_list, faces, colors_list, cameras, lights):
         """
         :param verts (B, V, 3)
         :param faces (F, 3)
@@ -309,7 +309,47 @@ class Renderer():
             device=self.device,
             shininess=0
         )
-        results = self.renderer(mesh, cameras=cameras, lights=lights, materials=materials)
+        return self.renderer(mesh, cameras=cameras, lights=lights, materials=materials)
+
+    def render_mask(
+        self,
+        verts_list,
+        faces,
+        colors_list,
+        cameras,
+        lights,
+        host_buffer=None,
+    ):
+        """Render only the alpha-derived mask used by the SLAM pipeline.
+
+        Keep the geometry, shader, rasterization, and mask threshold identical
+        to :meth:`render_multiple`, but avoid copying and converting the unused
+        full-resolution RGB render to host memory. ``host_buffer`` may be a
+        reusable CPU bool tensor with the output image shape.
+        """
+        results = self._render_multiple_rgba(
+            verts_list, faces, colors_list, cameras, lights
+        )
+        # Threshold before the device-to-host transfer so only the boolean mask,
+        # rather than a full float32 alpha image, is allocated on the host.
+        mask = results[0, ..., -1] > 0
+        if host_buffer is None:
+            return mask.cpu().numpy()
+        if (
+            host_buffer.device.type != "cpu"
+            or host_buffer.dtype != torch.bool
+            or tuple(host_buffer.shape) != tuple(mask.shape)
+        ):
+            raise ValueError(
+                "host_buffer must be a CPU bool tensor matching the rendered mask"
+            )
+        host_buffer.copy_(mask)
+        return host_buffer.numpy()
+
+    def render_multiple(self, verts_list, faces, colors_list, cameras, lights):
+        results = self._render_multiple_rgba(
+            verts_list, faces, colors_list, cameras, lights
+        )
         image = (results[0, ..., :3].cpu().numpy() * 255).astype(np.uint8)
         mask = results[0, ..., -1].cpu().numpy() > 0
         return image, mask
@@ -352,5 +392,3 @@ def get_global_cameras(verts, device, distance=5, position=(-5.0, 5.0, 0.0)):
     
     lights = PointLights(device=device, location=[position])
     return rotation, translation, lights
-
-

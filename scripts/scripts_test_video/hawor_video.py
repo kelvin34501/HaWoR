@@ -1,5 +1,8 @@
 from collections import defaultdict
 
+import ctypes
+import ctypes.util
+import gc
 import json
 import os
 import joblib
@@ -21,6 +24,20 @@ from lib.vis.renderer import Renderer
 from hawor.utils.process import get_mano_faces, run_mano, run_mano_left
 from hawor.utils.rotation import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
 from infiller.lib.model.network import TransformerModel
+
+_LIBC = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6', use_errno=True)
+_MASK_TRIM_INTERVAL = 32
+
+
+def _trim_host_memory(collect=False):
+    """Return released per-frame render buffers to the operating system."""
+    if collect:
+        gc.collect()
+    try:
+        _LIBC.malloc_trim(0)
+    except AttributeError:
+        pass
+
 
 def load_hawor(checkpoint_path):
     from pathlib import Path
@@ -108,6 +125,7 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
     model_masks = mask_file.create_dataset(
         'masks', shape=(len(frame_source), H, W), dtype=bool,
         chunks=(1, H, W), compression='gzip')
+    host_mask_buffer = torch.empty((H, W), dtype=torch.bool)
 
     bin_size = 128
     max_faces_per_bin = 20000
@@ -172,7 +190,21 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
             else:
                 do_flip = True
                 
-            results = model.inference(img_ck, boxes_ck, img_focal=img_focal, img_center=img_center, do_flip=do_flip)
+            results = model.inference(
+                img_ck,
+                boxes_ck,
+                img_focal=img_focal,
+                img_center=img_center,
+                do_flip=do_flip,
+            )
+            chunk_length = len(img_ck)
+            del img_ck
+            # No decoded frame is needed while masks are rendered. Release the
+            # final Decord reader and dead crop buffers before allocating
+            # full-resolution render targets; the source reopens lazily for the
+            # next frame chunk.
+            frame_source.close()
+            _trim_host_memory(collect=True)
 
             data_out = {
                 "init_root_orient": results["pred_rotmat"][None, :, 0], # (B, T, 3, 3)
@@ -206,25 +238,45 @@ def hawor_motion_estimation(args, start_idx, end_idx, seq_folder):
             # get hand mask
             data_out["init_root_orient"] = rotation_matrix_to_angle_axis(data_out["init_root_orient"])
             data_out["init_hand_pose"] = rotation_matrix_to_angle_axis(data_out["init_hand_pose"])
-            if do_flip: # left
-                outputs = run_mano_left(data_out["init_trans"], data_out["init_root_orient"], data_out["init_hand_pose"], betas=data_out["init_betas"])
-            else: # right
-                outputs = run_mano(data_out["init_trans"], data_out["init_root_orient"], data_out["init_hand_pose"], betas=data_out["init_betas"])
-            
-            vertices = outputs["vertices"][0].cpu()  # (T, N, 3)
-            for img_i in range(len(img_ck)):
-                if do_flip:
-                    faces = torch.from_numpy(faces_left).cuda()
-                else:
-                    faces = torch.from_numpy(faces_right).cuda()
+            with torch.no_grad():
+                mano_fn = run_mano_left if do_flip else run_mano
+                outputs = mano_fn(
+                    data_out["init_trans"],
+                    data_out["init_root_orient"],
+                    data_out["init_hand_pose"],
+                    betas=data_out["init_betas"],
+                )
+
+                vertices = outputs["vertices"][0].cpu()  # (T, N, 3)
+                render_faces = torch.from_numpy(
+                    faces_left if do_flip else faces_right
+                ).cuda()
                 cam_R = torch.eye(3).unsqueeze(0).cuda()
                 cam_T = torch.zeros(1, 3).cuda()
                 cameras, lights = renderer.create_camera_from_cv(cam_R, cam_T)
-                verts_color = torch.tensor([0, 0, 255, 255]) / 255
-                vertices_i = vertices[[img_i]]
-                rend, mask = renderer.render_multiple(vertices_i.unsqueeze(0).cuda(), faces, verts_color.unsqueeze(0).cuda(), cameras, lights)
-                
-                model_masks[frame_ck[img_i]] |= mask
+                verts_color = (
+                    torch.tensor([0, 0, 255, 255]) / 255
+                ).unsqueeze(0).cuda()
+
+                for img_i in range(chunk_length):
+                    vertices_i = vertices[[img_i]]
+                    mask = renderer.render_mask(
+                        vertices_i.unsqueeze(0).cuda(),
+                        render_faces,
+                        verts_color,
+                        cameras,
+                        lights,
+                        host_buffer=host_mask_buffer,
+                    )
+                    model_masks[frame_ck[img_i]] |= mask
+                    del vertices_i, mask
+
+                    if (img_i + 1) % _MASK_TRIM_INTERVAL == 0:
+                        _trim_host_memory()
+
+            del outputs, vertices, render_faces, cam_R, cam_T
+            del cameras, lights, verts_color
+            _trim_host_memory(collect=True)
 
     mask_file.close()  # masks already persisted incrementally into the HDF5 dataset
     joblib.dump(frame_chunks_all, f'{seq_folder}/tracks_{start_idx}_{end_idx}/frame_chunks_all.npy')
@@ -374,5 +426,3 @@ def hawor_infiller(args, start_idx, end_idx, frame_chunks_all):
     save_path = os.path.join(seq_folder, "world_space_res.pth")
     joblib.dump([pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid], save_path)
     return pred_trans, pred_rot, pred_hand_pose, pred_betas, pred_valid
-
-    
