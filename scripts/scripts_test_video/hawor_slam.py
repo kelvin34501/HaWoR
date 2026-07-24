@@ -1,6 +1,7 @@
 import math
 import sys
 import os
+import gc
 
 from natsort import natsorted
 
@@ -16,6 +17,7 @@ from PIL import Image
 from glob import glob
 from pycocotools import mask as masktool
 from lib.pipeline.masked_droid_slam import *
+from lib.pipeline.droid_slam_fallback import run_with_unmasked_fallback
 from lib.pipeline.frame_source import frame_source_from_args
 from lib.pipeline.est_scale import *
 from hawor.utils.process import block_print, enable_print
@@ -85,8 +87,17 @@ def hawor_slam(args, start_idx, end_idx):
     center = calib[2:]
     calib[:2] = focal
 
-    # Droid-slam with masking
-    droid, traj = run_slam(frame_source, masks=masks, calib=calib)
+    # Droid-slam with masking. Only the known empty-backend-graph failure gets
+    # one full, unmasked retry; all other failures propagate unchanged.
+    droid, traj = run_with_unmasked_fallback(
+        primary=lambda: run_slam(frame_source, masks=masks, calib=calib),
+        fallback=lambda: run_droid_slam(
+            frame_source,
+            calib=calib,
+            filter_thresh=1.5,
+        ),
+        cleanup=lambda: (gc.collect(), torch.cuda.empty_cache()),
+    )
     n = droid.video.counter.value
     tstamp = droid.video.tstamp.cpu().int().numpy()[:n]
     disps = droid.video.disps_up.cpu().numpy()[:n]
@@ -150,7 +161,6 @@ def hawor_slam(args, start_idx, end_idx):
 
     mask_file.close()
     frame_source.close()  # release decord buffers held during SLAM/Metric3D
-
 
 
 
