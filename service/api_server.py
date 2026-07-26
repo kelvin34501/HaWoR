@@ -138,7 +138,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--decord-recycle-after",
         type=int,
         default=None,
-        help="Decoded frames before reopening Decord (default 64; also "
+        help="Decoded frames before reopening Decord (default 4096; also "
              "HAWOR_DECORD_RECYCLE_AFTER)",
     )
     parser.add_argument("--s3mount-bin", default=None, help="Path to the s3mount binary")

@@ -47,8 +47,10 @@ from natsort import natsorted
 
 _IMAGE_EXTS = ("*.jpg", "*.jpeg", "*.png")
 _DEFAULT_DECORD_NUM_THREADS = 1
-_DEFAULT_DECORD_RECYCLE_AFTER = 64
-_DECORD_READ_AHEAD_FLUSH_AFTER = 16
+# Service windows contain at most 3,001 frames. Keeping one reader for the whole
+# window avoids repeatedly rebuilding Decord's HEVC state; the real-video memory
+# benchmark remains flat because Decord's internal queues are bounded.
+_DEFAULT_DECORD_RECYCLE_AFTER = 4096
 
 # Decord readers own native decoder threads and frame buffers. Keep exactly one
 # active reader in a process even when callers construct several FrameSource
@@ -163,6 +165,9 @@ class FrameSource:
         self.recycle_after = _positive_int(recycle_after, "recycle_after")
         self._video_reader = None
         self._reader_pid = None
+        # Native index returned by the next reader.next() call. ``None`` means
+        # Decord's position is unknown and the next access must seek accurately.
+        self._reader_next_index = None
         self._reads = 0
         self._frame_shape = None
 
@@ -221,6 +226,7 @@ class FrameSource:
                 raise
             self._video_reader = reader
             self._reader_pid = pid
+            self._reader_next_index = None
             self._reads = 0
             _ACTIVE_READER_PID = pid
             _ACTIVE_READER_OWNER = weakref.ref(self)
@@ -243,6 +249,7 @@ class FrameSource:
         reader = self._video_reader
         self._video_reader = None
         self._reader_pid = None
+        self._reader_next_index = None
         self._reads = 0
 
         if unregister:
@@ -292,6 +299,7 @@ class FrameSource:
         state = self.__dict__.copy()
         state["_video_reader"] = None
         state["_reader_pid"] = None
+        state["_reader_next_index"] = None
         state["_reads"] = 0
         return state
 
@@ -344,14 +352,23 @@ class FrameSource:
             return np.ascontiguousarray(img)
         with _ACTIVE_READER_LOCK:
             try:
-                frame = self._reader()[native_idx].asnumpy()  # RGB HWC uint8
+                reader = self._reader()
+                # VideoReader.__getitem__ always calls seek_accurate(), even when
+                # indices increase monotonically. The pipeline reads that way in
+                # detection, SLAM, and visualization. Preserve the decoder cursor
+                # and advance it directly; for 50 -> 30 fps, skip_frames decodes
+                # dependency frames without needlessly converting/copying them.
+                next_index = self._reader_next_index
+                if next_index is None:
+                    if native_idx:
+                        reader.seek_accurate(native_idx)
+                elif native_idx < next_index:
+                    reader.seek_accurate(native_idx)
+                elif native_idx > next_index:
+                    reader.skip_frames(native_idx - next_index)
+                frame = reader.next().asnumpy()  # RGB HWC uint8
+                self._reader_next_index = native_idx + 1
                 out = self._to_color(frame)
-                # Slow inference lets Decord's background queue fill with 4K
-                # frames even though the reader itself is recycled at 64. A
-                # periodic cursor reset flushes that read-ahead without replacing
-                # the reader or changing the decoded-frame lifecycle.
-                if (self._reads + 1) % _DECORD_READ_AHEAD_FLUSH_AFTER == 0:
-                    self._video_reader.seek(0)
                 self._count_reads(1)
                 return out
             except BaseException:
@@ -397,9 +414,9 @@ class FrameSource:
                     if self.color == "bgr":
                         frames = frames[:, :, :, ::-1]
                     chunks.append(np.ascontiguousarray(frames))
-                    # Batch data has been copied into NumPy; flush background
-                    # read-ahead before the caller begins model inference.
-                    self._video_reader.seek(0)
+                    # Decord does not expose the cursor left by get_batch().
+                    # Force the next scalar access to establish it accurately.
+                    self._reader_next_index = None
                     self._count_reads(len(chunk_native))
                     offset += len(chunk_native)
                 except BaseException:

@@ -36,6 +36,8 @@ class _FakeDecord(types.ModuleType):
         self.opens = []
         self.batch_sizes = []
         self.seeks = []
+        self.accurate_seeks = []
+        self.skips = []
         self.alive = set()
         self.fail_indices = set()
         self.VideoReader = self._video_reader
@@ -57,6 +59,9 @@ class _FakeDecord(types.ModuleType):
 
         class Reader:
 
+            def __init__(self):
+                self.cursor = 0
+
             def __len__(self):
                 return len(parent.frames)
 
@@ -69,6 +74,23 @@ class _FakeDecord(types.ModuleType):
                 if index in parent.fail_indices:
                     raise RuntimeError("synthetic decode failure")
                 return _FakeArray(parent.frames[index])
+
+            def next(self):
+                index = self.cursor
+                if index in parent.fail_indices:
+                    raise RuntimeError("synthetic decode failure")
+                self.cursor += 1
+                return _FakeArray(parent.frames[index])
+
+            def skip_frames(self, count):
+                count = int(count)
+                parent.skips.append(count)
+                self.cursor += count
+
+            def seek_accurate(self, index):
+                index = int(index)
+                parent.accurate_seeks.append(index)
+                self.cursor = index
 
             def get_batch(self, indices):
                 indices = [int(index) for index in indices]
@@ -107,7 +129,7 @@ class FrameSourceLifecycleTests(unittest.TestCase):
         self.decord_patch.stop()
         gc.collect()
 
-    def test_defaults_and_sequential_reads_cross_recycle_boundaries(self):
+    def test_defaults_keep_sequential_reader_for_service_window(self):
         with mock.patch.dict(
             os.environ,
             {"HAWOR_DECORD_NUM_THREADS": "", "HAWOR_DECORD_RECYCLE_AFTER": ""},
@@ -118,10 +140,12 @@ class FrameSourceLifecycleTests(unittest.TestCase):
             source = FrameSource("video.mp4", color="rgb")
 
         self.assertEqual(source.num_threads, 1)
-        self.assertEqual(source.recycle_after, 64)
+        self.assertEqual(source.recycle_after, 4096)
         decoded = [source[index] for index in range(150)]
-        self.assertEqual(len(self.decord.opens), 3)
-        self.assertEqual(self.decord.seeks, [0] * 9)
+        self.assertEqual(len(self.decord.opens), 1)
+        self.assertEqual(self.decord.seeks, [])
+        self.assertEqual(self.decord.accurate_seeks, [])
+        self.assertEqual(self.decord.skips, [])
         self.assertEqual(decoded[129][0, 0].tolist(), self.decord.frames[129, 0, 0].tolist())
         self.assertEqual(len(self.decord.alive), 1)
 
@@ -129,6 +153,24 @@ class FrameSourceLifecycleTests(unittest.TestCase):
         self.assertIsNone(source._video_reader)
         self.assertEqual(len(self.decord.alive), 0)
         source.close()
+
+    def test_monotonic_resampling_uses_decoder_cursor(self):
+        source = FrameSource(
+            "video.mp4", target_fps=15, color="rgb", recycle_after=4096
+        )
+
+        decoded = [source[index] for index in range(4)]
+        self.assertEqual(
+            [frame[0, 0].tolist() for frame in decoded],
+            [self.decord.frames[index, 0, 0].tolist() for index in (0, 2, 4, 6)],
+        )
+        self.assertEqual(self.decord.accurate_seeks, [])
+        self.assertEqual(self.decord.skips, [1, 1, 1])
+
+        # A backward/random access still establishes the exact requested cursor.
+        frame = source[1]
+        self.assertEqual(frame[0, 0].tolist(), self.decord.frames[2, 0, 0].tolist())
+        self.assertEqual(self.decord.accurate_seeks, [2])
 
     def test_window_fancy_batch_and_color_access_across_recycles(self):
         source = FrameSource(
@@ -152,8 +194,10 @@ class FrameSourceLifecycleTests(unittest.TestCase):
         rgb = FrameSource("video.mp4", color="rgb")
         rgb_pixel = rgb[7][0, 0].copy()
         bgr = FrameSource("video.mp4", color="bgr")
-        bgr_pixel = bgr[7][0, 0].copy()
+        bgr_frame = bgr[7]
+        bgr_pixel = bgr_frame[0, 0].copy()
         self.assertEqual(rgb_pixel.tolist(), bgr_pixel[::-1].tolist())
+        self.assertTrue(bgr_frame.flags.c_contiguous)
 
     def test_only_one_reader_is_active_per_process(self):
         first = FrameSource("first.mp4")

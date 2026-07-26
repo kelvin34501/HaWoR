@@ -25,7 +25,7 @@ class ServiceConfig:
     copy_extracted_images: bool = True
     run_visualizations: bool = False
     decord_num_threads: int = 1
-    decord_recycle_after: int = 64
+    decord_recycle_after: int = 4096
 
 
 def load_service_config(
@@ -90,7 +90,7 @@ def load_service_config(
     resolved_decord_recycle_after = _positive_int_setting(
         decord_recycle_after,
         env_name="HAWOR_DECORD_RECYCLE_AFTER",
-        default=64,
+        default=4096,
         setting_name="decord_recycle_after",
     )
 

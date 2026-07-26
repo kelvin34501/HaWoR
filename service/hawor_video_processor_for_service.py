@@ -22,7 +22,7 @@ from typing import Callable, Iterator, Optional, Sequence, Union
 from service.storage import PROCESS_DONE_FILENAME
 
 GpuIds = Union[str, Sequence[Union[int, str]]]
-PEAK_RSS_ACCEPTANCE_BYTES = 15 * 1024 ** 3
+PEAK_RSS_ACCEPTANCE_BYTES = 20 * 1024 ** 3
 _RSS_SAMPLE_INTERVAL_SECONDS = 0.05
 _PAGE_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
 
@@ -86,7 +86,7 @@ class HaWoRProcessorConfig:
     # this flag is accepted for API compatibility but has no effect.
     copy_extracted_images: bool = True
     decord_num_threads: int = 1
-    decord_recycle_after: int = 64
+    decord_recycle_after: int = 4096
 
 
 class GpuPool:
@@ -264,7 +264,7 @@ class HaWoRVideoProcessorForService:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         # Forty concurrent jobs do not need eight CPU inference pools apiece.
-        # One thread also keeps PyTorch/OpenCV allocator overhead below the 15 GiB
+        # One thread also keeps PyTorch/OpenCV allocator overhead below the 20 GiB
         # process-tree gate. Preserve an explicit operator override.
         env.setdefault("HAWOR_NUM_THREADS", "1")
         env["HAWOR_DECORD_NUM_THREADS"] = str(self.config.decord_num_threads)

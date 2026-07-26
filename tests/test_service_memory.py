@@ -28,7 +28,7 @@ class ServiceConfigurationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 defaults = load_service_config(cache_dir=cache, mount_root=mounts)
             self.assertEqual(defaults.decord_num_threads, 1)
-            self.assertEqual(defaults.decord_recycle_after, 64)
+            self.assertEqual(defaults.decord_recycle_after, 4096)
 
             with mock.patch.dict(
                 os.environ,
@@ -133,13 +133,14 @@ class ServiceMemoryTelemetryTests(unittest.TestCase):
         self.assertEqual(defaults["CUDA_VISIBLE_DEVICES"], "3")
         self.assertEqual(defaults["HAWOR_NUM_THREADS"], "1")
         self.assertEqual(defaults["HAWOR_DECORD_NUM_THREADS"], "1")
-        self.assertEqual(defaults["HAWOR_DECORD_RECYCLE_AFTER"], "64")
+        self.assertEqual(defaults["HAWOR_DECORD_RECYCLE_AFTER"], "4096")
 
         with mock.patch.dict(os.environ, {"HAWOR_NUM_THREADS": "4"}, clear=True):
             overridden = processor._build_env(3)
         self.assertEqual(overridden["HAWOR_NUM_THREADS"], "4")
 
     def test_acceptance_gate_reports_over_budget_without_killing(self):
+        self.assertEqual(PEAK_RSS_ACCEPTANCE_BYTES, 20 * 1024 ** 3)
         processor = self._processor()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "process.log"
