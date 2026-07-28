@@ -10,6 +10,7 @@ from unittest import mock
 
 from service.config import load_service_config
 from service.hawor_video_processor_for_service import (
+    COPY_BACK_DISPARITY_ARTIFACTS,
     PEAK_RSS_ACCEPTANCE_BYTES,
     HaWoRProcessorConfig,
     HaWoRVideoProcessorForService,
@@ -243,6 +244,88 @@ class ServiceMemoryTelemetryTests(unittest.TestCase):
                 )
             finally:
                 manager.shutdown()
+
+
+class ServiceOutputArtifactTests(unittest.TestCase):
+
+    def _processor(self):
+        return HaWoRVideoProcessorForService(
+            config=HaWoRProcessorConfig(
+                project_dir=Path(__file__).resolve().parents[1],
+                run_post_steps=False,
+                run_world_space=False,
+                run_visualizations=False,
+            )
+        )
+
+    def test_disparity_cleanup_only_deletes_transient_exports(self):
+        self.assertFalse(COPY_BACK_DISPARITY_ARTIFACTS)
+        processor = self._processor()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            slam_dir = output_dir / "SLAM"
+            slam_dir.mkdir()
+            transient_npz = slam_dir / "hawor_slam_w_scale_disps_0_10_50fps.npz"
+            transient_mkv = slam_dir / "hawor_slam_w_scale_disps_0_10_50fps_uint16.mkv"
+            retained_slam = slam_dir / "hawor_slam_w_scale_0_10_50fps.npz"
+            retained_video = slam_dir / "diagnostic.mkv"
+            for path in (
+                transient_npz,
+                transient_mkv,
+                retained_slam,
+                retained_video,
+            ):
+                path.write_bytes(b"x")
+
+            processor._delete_disparity_artifacts(output_dir)
+
+            self.assertFalse(transient_npz.exists())
+            self.assertFalse(transient_mkv.exists())
+            self.assertTrue(retained_slam.exists())
+            self.assertTrue(retained_video.exists())
+
+    def test_process_video_does_not_copy_back_disparity_exports(self):
+        processor = self._processor()
+
+        def create_merged_output(_video, work_dir, *_args):
+            slam_dir = work_dir / "merged" / "SLAM"
+            slam_dir.mkdir(parents=True)
+            (slam_dir / "hawor_slam_w_scale_disps_0_10_50fps.npz").write_bytes(b"disp")
+            (slam_dir / "hawor_slam_w_scale_disps_0_10_50fps_uint16.mkv").write_bytes(b"disp")
+            (slam_dir / "hawor_slam_w_scale_0_10_50fps.npz").write_bytes(b"traj")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "clip.mp4"
+            video.write_bytes(b"video")
+            output_dir = root / "output"
+            scratch_dir = root / "scratch"
+
+            with mock.patch.object(
+                processor,
+                "_run_segmented_pipeline",
+                side_effect=create_merged_output,
+            ):
+                processor.process_video(
+                    video,
+                    output_dir,
+                    scratch_dir=scratch_dir,
+                )
+
+            slam_dir = output_dir / "SLAM"
+            self.assertFalse(
+                (slam_dir / "hawor_slam_w_scale_disps_0_10_50fps.npz").exists()
+            )
+            self.assertFalse(
+                (
+                    slam_dir
+                    / "hawor_slam_w_scale_disps_0_10_50fps_uint16.mkv"
+                ).exists()
+            )
+            self.assertTrue(
+                (slam_dir / "hawor_slam_w_scale_0_10_50fps.npz").exists()
+            )
 
 
 if __name__ == "__main__":

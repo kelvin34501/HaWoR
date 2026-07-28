@@ -23,6 +23,10 @@ from service.storage import PROCESS_DONE_FILENAME
 
 GpuIds = Union[str, Sequence[Union[int, str]]]
 PEAK_RSS_ACCEPTANCE_BYTES = 20 * 1024 ** 3
+# Interpolated disparity exports are transient inputs/diagnostics. Publishing
+# them can roughly double the per-video result size, so the server API keeps
+# them in local scratch only.
+COPY_BACK_DISPARITY_ARTIFACTS = False
 _RSS_SAMPLE_INTERVAL_SECONDS = 0.05
 _PAGE_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
 
@@ -196,6 +200,9 @@ class HaWoRVideoProcessorForService:
                         staged_output_dir, video, live_log_path, env, peak_rss
                     )
 
+                if not COPY_BACK_DISPARITY_ARTIFACTS:
+                    self._delete_disparity_artifacts(staged_output_dir)
+
                 cam_space_vis_path: Optional[Path] = None
                 world_space_vis_path: Optional[Path] = None
                 if self.config.run_visualizations:
@@ -350,6 +357,17 @@ class HaWoRVideoProcessorForService:
                 self._copy_tree_data_only(entry, target)
             else:
                 shutil.copyfile(entry, target)
+
+    def _delete_disparity_artifacts(self, output_dir: Path) -> None:
+        """Delete transient interpolated disparity NPZ/MKV files before publish."""
+        slam_dir = output_dir / "SLAM"
+        if not slam_dir.is_dir():
+            return
+
+        artifacts = set(slam_dir.glob("*_disps_*.npz"))
+        artifacts.update(slam_dir.glob("*_disps_*_uint16.mkv"))
+        for artifact in sorted(artifacts):
+            artifact.unlink()
 
     def _publish_log(self, live_log_path: Path, final_log_path: Path) -> None:
         """Copy the local scratch log to the (possibly s3mount) output directory.
