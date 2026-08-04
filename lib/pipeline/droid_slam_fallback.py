@@ -27,8 +27,13 @@ def _is_empty_proximity_graph_error(exc):
     )
 
 
-def run_with_unmasked_fallback(primary, fallback, cleanup):
-    """Run masked SLAM, retrying once only for the known empty-graph error."""
+def run_with_unmasked_fallback(
+    primary,
+    fallback,
+    cleanup,
+    terminal_fallback=None,
+):
+    """Retry an empty masked graph unmasked, then optionally use a terminal fallback."""
     try:
         return primary()
     except ValueError as exc:
@@ -42,4 +47,17 @@ def run_with_unmasked_fallback(primary, fallback, cleanup):
         "[slam:fallback] Masked DROID produced an empty proximity graph; "
         "retrying the complete chunk without masks"
     )
-    return fallback()
+    try:
+        return fallback()
+    except ValueError as exc:
+        if terminal_fallback is None or not _is_empty_proximity_graph_error(exc):
+            raise
+
+    # As above, clean up only after leaving the except block so the traceback no
+    # longer retains the failed DROID instance and its GPU tensors.
+    cleanup()
+    print(
+        "[slam:fallback] Unmasked DROID also produced an empty proximity graph; "
+        "using an identical camera pose throughout the chunk"
+    )
+    return terminal_fallback()

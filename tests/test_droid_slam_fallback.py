@@ -133,6 +133,58 @@ class DroidSlamFallbackTest(unittest.TestCase):
         self.assertIs(caught.exception, fallback_error)
         self.assertEqual(events, ["cleanup", "fallback"])
 
+    def test_second_empty_graph_error_runs_terminal_fallback(self):
+        events = []
+
+        def fallback():
+            events.append("fallback")
+            raise_backend_empty_graph()
+
+        result = run_with_unmasked_fallback(
+            primary=raise_backend_empty_graph,
+            fallback=fallback,
+            cleanup=lambda: events.append("cleanup"),
+            terminal_fallback=lambda: (
+                events.append("terminal"),
+                (None, "constant-traj"),
+            )[1],
+        )
+
+        self.assertEqual(result, (None, "constant-traj"))
+        self.assertEqual(
+            events,
+            ["cleanup", "fallback", "cleanup", "terminal"],
+        )
+
+    def test_second_empty_graph_error_propagates_without_terminal_fallback(self):
+        events = []
+
+        def fallback():
+            events.append("fallback")
+            raise_backend_empty_graph()
+
+        with self.assertRaisesRegex(ValueError, "not enough values to unpack"):
+            run_with_unmasked_fallback(
+                primary=raise_backend_empty_graph,
+                fallback=fallback,
+                cleanup=lambda: events.append("cleanup"),
+            )
+
+        self.assertEqual(events, ["cleanup", "fallback"])
+
+    def test_unrelated_second_value_error_does_not_run_terminal_fallback(self):
+        events = []
+
+        with self.assertRaisesRegex(ValueError, "different failure"):
+            run_with_unmasked_fallback(
+                primary=raise_backend_empty_graph,
+                fallback=lambda: raise_backend_empty_graph("different failure"),
+                cleanup=lambda: events.append("cleanup"),
+                terminal_fallback=lambda: events.append("terminal"),
+            )
+
+        self.assertEqual(events, ["cleanup"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,10 @@ from glob import glob
 from pycocotools import mask as masktool
 from lib.pipeline.masked_droid_slam import *
 from lib.pipeline.droid_slam_fallback import run_with_unmasked_fallback
+from lib.pipeline.slam_artifact_fallback import (
+    constant_camera_trajectory,
+    metric_depth_to_disparity,
+)
 from lib.pipeline.frame_source import frame_source_from_args
 from lib.pipeline.est_scale import *
 from hawor.utils.process import block_print, enable_print
@@ -88,7 +92,8 @@ def hawor_slam(args, start_idx, end_idx):
     calib[:2] = focal
 
     # Droid-slam with masking. Only the known empty-backend-graph failure gets
-    # one full, unmasked retry; all other failures propagate unchanged.
+    # one full, unmasked retry and then a constant-pose terminal fallback; all
+    # other failures propagate unchanged.
     droid, traj = run_with_unmasked_fallback(
         primary=lambda: run_slam(frame_source, masks=masks, calib=calib),
         fallback=lambda: run_droid_slam(
@@ -97,14 +102,26 @@ def hawor_slam(args, start_idx, end_idx):
             filter_thresh=1.5,
         ),
         cleanup=lambda: (gc.collect(), torch.cuda.empty_cache()),
+        terminal_fallback=lambda: (
+            None,
+            constant_camera_trajectory(len(frame_source)),
+        ),
     )
-    n = droid.video.counter.value
-    tstamp = droid.video.tstamp.cpu().int().numpy()[:n]
-    disps = droid.video.disps_up.cpu().numpy()[:n]
-    print('DBA errors:', droid.backend.errors)
+    constant_pose_fallback = droid is None
+    if constant_pose_fallback:
+        # Keep disparity sparse, as in a normal DROID output. Metric3D below
+        # supplies a valid inverse-metric-depth map for this timestamp.
+        tstamp = np.asarray([0], dtype=np.int32)
+        disps = None
+        print('DBA errors: unavailable (constant-pose fallback)')
+    else:
+        n = droid.video.counter.value
+        tstamp = droid.video.tstamp.cpu().int().numpy()[:n]
+        disps = droid.video.disps_up.cpu().numpy()[:n]
+        print('DBA errors:', droid.backend.errors)
 
-    del droid
-    torch.cuda.empty_cache()
+        del droid
+        torch.cuda.empty_cache()
 
     # Estimate scale  
     block_print()  
@@ -130,25 +147,35 @@ def hawor_slam(args, start_idx, end_idx):
     #     np.savez_compressed(f"{save_path}/depth_{i}.npz", depth=depth)
 
     ##### Estimate Metric Scale #####
-    print('Estimating Metric Scale ...')
-    scales_ = []
-    n = len(tstamp)   # for each keyframe
-    for i in tqdm(range(n)):
-        t = tstamp[i]
-        disp = disps[i]
-        pred_depth = pred_depths[i]
-        slam_depth = 1/disp
-        
-        # Estimate scene scale
-        msk = np.asarray(masks[int(t)]).astype(np.uint8)
-        scale = est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=msk, near_thresh=min_threshold, far_thresh=max_threshold)  
-        while math.isnan(scale):
-            min_threshold -= 0.1
-            max_threshold += 0.1
-            scale = est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=msk, near_thresh=min_threshold, far_thresh=max_threshold)                    
-        scales_.append(scale)
+    if constant_pose_fallback:
+        disparity, used_unit_plane = metric_depth_to_disparity(pred_depths[0])
+        disps = disparity[None]
+        median_s = np.float32(1.0)
+        if used_unit_plane:
+            print(
+                '[slam:fallback] Metric3D returned no positive finite depth; '
+                'using a unit-disparity plane'
+            )
+    else:
+        print('Estimating Metric Scale ...')
+        scales_ = []
+        n = len(tstamp)   # for each keyframe
+        for i in tqdm(range(n)):
+            t = tstamp[i]
+            disp = disps[i]
+            pred_depth = pred_depths[i]
+            slam_depth = 1/disp
 
-    median_s = np.median(scales_)
+            # Estimate scene scale
+            msk = np.asarray(masks[int(t)]).astype(np.uint8)
+            scale = est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=msk, near_thresh=min_threshold, far_thresh=max_threshold)
+            while math.isnan(scale):
+                min_threshold -= 0.1
+                max_threshold += 0.1
+                scale = est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=msk, near_thresh=min_threshold, far_thresh=max_threshold)
+            scales_.append(scale)
+
+        median_s = np.median(scales_)
     print(f"estimated scale: {median_s}")
 
     # Save results
@@ -157,13 +184,13 @@ def hawor_slam(args, start_idx, end_idx):
     np.savez(save_path,
             tstamp=tstamp, disps=disps, traj=traj,
             img_focal=focal, img_center=calib[-2:],
-            scale=median_s)
+            scale=median_s,
+            slam_valid=np.asarray(not constant_pose_fallback),
+            slam_fallback=np.asarray(
+                'constant_pose' if constant_pose_fallback else 'none'
+            ))
 
     mask_file.close()
     frame_source.close()  # release decord buffers held during SLAM/Metric3D
-
-
-
-
 
 
