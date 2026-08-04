@@ -69,6 +69,9 @@ def create_app(service_config: Optional[ServiceConfig] = None) -> FastAPI:
             "run_visualizations": config.run_visualizations,
             "decord_num_threads": config.decord_num_threads,
             "decord_recycle_after": config.decord_recycle_after,
+            "window_context_frames": config.window_context_frames,
+            "temporal_block_frames": config.temporal_block_frames,
+            "normalize_input_timestamps": config.normalize_input_timestamps,
         }
 
     @app.post("/v1/annotate", status_code=202)
@@ -141,6 +144,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Decoded frames before reopening Decord (default 4096; also "
              "HAWOR_DECORD_RECYCLE_AFTER)",
     )
+    parser.add_argument(
+        "--window-context-frames",
+        type=int,
+        default=None,
+        help="Real-frame context on both sides of an outer window (default 16; "
+             "also HAWOR_WINDOW_CONTEXT_FRAMES)",
+    )
+    parser.add_argument(
+        "--temporal-block-frames",
+        type=int,
+        default=None,
+        help="Global outer-window alignment for HaWoR temporal blocks (default "
+             "16; also HAWOR_TEMPORAL_BLOCK_FRAMES)",
+    )
+    parser.add_argument(
+        "--normalize-input-timestamps",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stream-copy unsafe negative-PTS inputs into job scratch before "
+             "decoding (default true; also HAWOR_NORMALIZE_INPUT_TIMESTAMPS)",
+    )
     parser.add_argument("--s3mount-bin", default=None, help="Path to the s3mount binary")
     parser.add_argument("--mount-root", default=None, help="Root directory for per-job bucket mounts")
     parser.add_argument("--mount-ready-timeout",
@@ -192,6 +216,9 @@ def main() -> None:
         mount_ready_timeout=args.mount_ready_timeout,
         decord_num_threads=args.decord_num_threads,
         decord_recycle_after=args.decord_recycle_after,
+        window_context_frames=args.window_context_frames,
+        temporal_block_frames=args.temporal_block_frames,
+        normalize_input_timestamps=args.normalize_input_timestamps,
     )
     uvicorn.run(create_app(config), host=config.host, port=config.port)
 

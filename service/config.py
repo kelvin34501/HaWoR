@@ -26,6 +26,9 @@ class ServiceConfig:
     run_visualizations: bool = False
     decord_num_threads: int = 1
     decord_recycle_after: int = 4096
+    window_context_frames: int = 16
+    temporal_block_frames: int = 16
+    normalize_input_timestamps: bool = True
 
 
 def load_service_config(
@@ -45,6 +48,9 @@ def load_service_config(
     mount_ready_timeout: Optional[float] = None,
     decord_num_threads: Optional[int] = None,
     decord_recycle_after: Optional[int] = None,
+    window_context_frames: Optional[int] = None,
+    temporal_block_frames: Optional[int] = None,
+    normalize_input_timestamps: Optional[bool] = None,
 ) -> ServiceConfig:
     resolved_cache_dir = Path(cache_dir or os.getenv("HAWOR_CACHE_DIR", ".hawor_cache")).expanduser().resolve()
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +99,28 @@ def load_service_config(
         default=4096,
         setting_name="decord_recycle_after",
     )
+    resolved_window_context_frames = _nonnegative_int_setting(
+        window_context_frames,
+        env_name="HAWOR_WINDOW_CONTEXT_FRAMES",
+        default=16,
+        setting_name="window_context_frames",
+    )
+    resolved_temporal_block_frames = _positive_int_setting(
+        temporal_block_frames,
+        env_name="HAWOR_TEMPORAL_BLOCK_FRAMES",
+        default=16,
+        setting_name="temporal_block_frames",
+    )
+    available_owned_frames = 3001 - 2 * resolved_window_context_frames
+    if available_owned_frames < 1:
+        raise ValueError(
+            "window_context_frames is too large for the 3001-frame process cap"
+        )
+    if resolved_temporal_block_frames > available_owned_frames:
+        raise ValueError(
+            "temporal_block_frames does not fit with window_context_frames "
+            "under the 3001-frame process cap"
+        )
 
     return ServiceConfig(
         cache_dir=resolved_cache_dir,
@@ -114,6 +142,13 @@ def load_service_config(
             "HAWOR_RUN_VISUALIZATIONS", default=False)),
         decord_num_threads=resolved_decord_num_threads,
         decord_recycle_after=resolved_decord_recycle_after,
+        window_context_frames=resolved_window_context_frames,
+        temporal_block_frames=resolved_temporal_block_frames,
+        normalize_input_timestamps=(
+            normalize_input_timestamps
+            if normalize_input_timestamps is not None
+            else _parse_bool_env("HAWOR_NORMALIZE_INPUT_TIMESTAMPS", default=True)
+        ),
     )
 
 
@@ -146,6 +181,25 @@ def _positive_int_setting(
         raise ValueError(f"{setting_name} must be a positive integer") from exc
     if value < 1:
         raise ValueError(f"{setting_name} must be a positive integer")
+    return value
+
+
+def _nonnegative_int_setting(
+    explicit_value: Optional[int],
+    *,
+    env_name: str,
+    default: int,
+    setting_name: str,
+) -> int:
+    raw_value = explicit_value
+    if raw_value is None:
+        raw_value = os.getenv(env_name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{setting_name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{setting_name} must be a non-negative integer")
     return value
 
 

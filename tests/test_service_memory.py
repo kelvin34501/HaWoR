@@ -30,18 +30,27 @@ class ServiceConfigurationTests(unittest.TestCase):
                 defaults = load_service_config(cache_dir=cache, mount_root=mounts)
             self.assertEqual(defaults.decord_num_threads, 1)
             self.assertEqual(defaults.decord_recycle_after, 4096)
+            self.assertEqual(defaults.window_context_frames, 16)
+            self.assertEqual(defaults.temporal_block_frames, 16)
+            self.assertTrue(defaults.normalize_input_timestamps)
 
             with mock.patch.dict(
                 os.environ,
                 {
                     "HAWOR_DECORD_NUM_THREADS": "2",
                     "HAWOR_DECORD_RECYCLE_AFTER": "96",
+                    "HAWOR_WINDOW_CONTEXT_FRAMES": "24",
+                    "HAWOR_TEMPORAL_BLOCK_FRAMES": "8",
+                    "HAWOR_NORMALIZE_INPUT_TIMESTAMPS": "false",
                 },
                 clear=True,
             ):
                 overridden = load_service_config(cache_dir=cache, mount_root=mounts)
             self.assertEqual(overridden.decord_num_threads, 2)
             self.assertEqual(overridden.decord_recycle_after, 96)
+            self.assertEqual(overridden.window_context_frames, 24)
+            self.assertEqual(overridden.temporal_block_frames, 8)
+            self.assertFalse(overridden.normalize_input_timestamps)
 
             for name, value in (
                 ("HAWOR_DECORD_NUM_THREADS", "0"),
@@ -52,6 +61,17 @@ class ServiceConfigurationTests(unittest.TestCase):
                 with self.subTest(name=name, value=value):
                     with mock.patch.dict(os.environ, {name: value}, clear=True):
                         with self.assertRaisesRegex(ValueError, "positive integer"):
+                            load_service_config(cache_dir=cache, mount_root=mounts)
+
+            for name, value, message in (
+                ("HAWOR_WINDOW_CONTEXT_FRAMES", "-1", "non-negative integer"),
+                ("HAWOR_WINDOW_CONTEXT_FRAMES", "invalid", "non-negative integer"),
+                ("HAWOR_TEMPORAL_BLOCK_FRAMES", "0", "positive integer"),
+                ("HAWOR_NORMALIZE_INPUT_TIMESTAMPS", "invalid", "Invalid boolean"),
+            ):
+                with self.subTest(name=name, value=value):
+                    with mock.patch.dict(os.environ, {name: value}, clear=True):
+                        with self.assertRaisesRegex(ValueError, message):
                             load_service_config(cache_dir=cache, mount_root=mounts)
 
     def test_cli_and_health_expose_decoder_settings(self):
@@ -68,16 +88,32 @@ class ServiceConfigurationTests(unittest.TestCase):
                 from service.api_server import _build_arg_parser, create_app
 
             args = _build_arg_parser().parse_args(
-                ["--decord-num-threads", "2", "--decord-recycle-after", "80"]
+                [
+                    "--decord-num-threads",
+                    "2",
+                    "--decord-recycle-after",
+                    "80",
+                    "--window-context-frames",
+                    "24",
+                    "--temporal-block-frames",
+                    "8",
+                    "--no-normalize-input-timestamps",
+                ]
             )
             self.assertEqual(args.decord_num_threads, 2)
             self.assertEqual(args.decord_recycle_after, 80)
+            self.assertEqual(args.window_context_frames, 24)
+            self.assertEqual(args.temporal_block_frames, 8)
+            self.assertFalse(args.normalize_input_timestamps)
 
             config = load_service_config(
                 cache_dir=Path(tmp) / "cache",
                 mount_root=Path(tmp) / "mounts",
                 decord_num_threads=2,
                 decord_recycle_after=80,
+                window_context_frames=24,
+                temporal_block_frames=8,
+                normalize_input_timestamps=False,
             )
             app = create_app(config)
             health_endpoint = next(
@@ -87,6 +123,28 @@ class ServiceConfigurationTests(unittest.TestCase):
             health = health_endpoint()
         self.assertEqual(health["decord_num_threads"], 2)
         self.assertEqual(health["decord_recycle_after"], 80)
+        self.assertEqual(health["window_context_frames"], 24)
+        self.assertEqual(health["temporal_block_frames"], 8)
+        self.assertFalse(health["normalize_input_timestamps"])
+
+    def test_job_manager_passes_video_safety_settings_to_processor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_service_config(
+                cache_dir=Path(tmp) / "cache",
+                mount_root=Path(tmp) / "mounts",
+                window_context_frames=24,
+                temporal_block_frames=8,
+                normalize_input_timestamps=False,
+            )
+            manager = JobManager(config)
+            try:
+                processor = manager._build_processor("off")
+            finally:
+                manager.shutdown()
+
+        self.assertEqual(processor.config.window_context_frames, 24)
+        self.assertEqual(processor.config.temporal_block_frames, 8)
+        self.assertFalse(processor.config.normalize_input_timestamps)
 
 
 class ServiceMemoryTelemetryTests(unittest.TestCase):
@@ -306,6 +364,10 @@ class ServiceOutputArtifactTests(unittest.TestCase):
                 processor,
                 "_run_segmented_pipeline",
                 side_effect=create_merged_output,
+            ), mock.patch.object(
+                processor,
+                "_prepare_video_for_processing",
+                return_value=video,
             ):
                 processor.process_video(
                     video,

@@ -32,6 +32,9 @@ export HAWOR_RUN_VISUALIZATIONS=false
 export HAWOR_NUM_THREADS=1
 export HAWOR_DECORD_NUM_THREADS=1
 export HAWOR_DECORD_RECYCLE_AFTER=4096
+export HAWOR_WINDOW_CONTEXT_FRAMES=16
+export HAWOR_TEMPORAL_BLOCK_FRAMES=16
+export HAWOR_NORMALIZE_INPUT_TIMESTAMPS=true
 export HAWOR_S3MOUNT_BIN=/mnt/petrelfs/share_data/s3mount
 export HAWOR_MOUNT_ROOT=/mnt/oss
 export HAWOR_MOUNT_READY_TIMEOUT=30
@@ -51,6 +54,9 @@ Common startup options:
 - `HAWOR_NUM_THREADS`: CPU inference-pool threads per video subprocess (service-child default `1`; an explicit operator value is preserved).
 - `--decord-num-threads` (`HAWOR_DECORD_NUM_THREADS`): Decord threads per video process (default `1`). Values must be positive.
 - `--decord-recycle-after` (`HAWOR_DECORD_RECYCLE_AFTER`): decoded frames per native reader before it is released and reopened (default `4096`, longer than the maximum 3,001-frame service window). Values must be positive.
+- `--window-context-frames` (`HAWOR_WINDOW_CONTEXT_FRAMES`): real input frames retained on both sides of an outer processing window (default `16`). Context predictions are rotation-aware blended across camera-space seams and provide multiple shared poses for SLAM alignment.
+- `--temporal-block-frames` (`HAWOR_TEMPORAL_BLOCK_FRAMES`): alignment of interior owned-window boundaries (default `16`, matching the HaWoR temporal block). The context and alignment are included inside the existing 3,001-frame process cap.
+- `--normalize-input-timestamps` / `--no-normalize-input-timestamps` (`HAWOR_NORMALIZE_INPUT_TIMESTAMPS`): inspect input packet timestamps and stream-copy negative-PTS inputs to local job scratch before any decoder or renderer sees them (default `true`). The source object/file is never modified.
 - `--s3mount-bin`: path to the `s3mount` binary (default `s3mount` on `PATH`).
 - `--mount-root`: root directory for per-job bucket mounts (default `/mnt/oss`).
 - `--mount-ready-timeout`: seconds to wait for a mount to become ready (default `30`).
@@ -130,6 +136,8 @@ Returns `status`, `cache_dir`, `gpu_ids`, cache cleanup flags, `mount_root`,
 
 ## Current Behavior
 
+- Input video packet timestamps are checked before GPU processing. Unsafe negative-PTS video streams are normalized losslessly in local job scratch and the verified scratch path is used consistently by reconstruction, interpolation, and visualization.
+- Videos exceeding one processing window use 16 real context frames on both sides, globally aligned 16-frame owned boundaries, rotation-aware camera-pose crossfading, and multi-pose SLAM overlap alignment. A single short video still runs as one unchanged window.
 - Only scans the top level of the `input_url` directory or prefix; no recursive scan.
 - Outputs always go to `annotations/<video_stem>/` under the same input directory.
 - `input_url` accepts an `s3://bucket/prefix` or a local directory. `endpoint`, access/secret keys, `region`, `force_path_style`, and `use_listobject_v2` apply only to S3 input.

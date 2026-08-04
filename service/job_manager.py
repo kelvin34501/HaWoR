@@ -394,6 +394,9 @@ class JobManager:
                 run_visualizations=self.config.run_visualizations,
                 decord_num_threads=self.config.decord_num_threads,
                 decord_recycle_after=self.config.decord_recycle_after,
+                window_context_frames=self.config.window_context_frames,
+                temporal_block_frames=self.config.temporal_block_frames,
+                normalize_input_timestamps=self.config.normalize_input_timestamps,
             ),
             gpu_pool=self._gpu_pool,
         )

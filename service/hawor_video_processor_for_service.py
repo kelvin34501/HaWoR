@@ -8,6 +8,7 @@ folder-level service execution. The original script remains unchanged.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import queue
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, Union
 
@@ -69,11 +71,30 @@ class HaWoRProcessResult:
 
 
 @dataclass(frozen=True)
+class VideoTimingInfo:
+    codec_name: str
+    fps: Fraction
+    is_cfr: bool
+    has_b_frames: bool
+    min_pts_seconds: float
+    min_dts_seconds: float
+
+    @property
+    def has_negative_presentation_timestamps(self) -> bool:
+        return self.min_pts_seconds < -1e-6
+
+
+@dataclass(frozen=True)
 class HaWoRProcessorConfig:
     project_dir: Path = Path(__file__).resolve().parents[1]
     segment_seconds: int = 100
     min_last_segment_seconds: int = 50
     max_chunk_frames: int = 3001
+    # HaWoR uses non-overlapping 16-frame temporal blocks. Outer windows retain
+    # real context, align their owned boundaries, and crossfade shared-context
+    # predictions so an API seam cannot hard-cut between restarted track phases.
+    window_context_frames: int = 16
+    temporal_block_frames: int = 16
     overlap_policy: str = "keep_last"
     vis_mode: str = "off"
     target_fps: float = 30
@@ -91,6 +112,7 @@ class HaWoRProcessorConfig:
     copy_extracted_images: bool = True
     decord_num_threads: int = 1
     decord_recycle_after: int = 4096
+    normalize_input_timestamps: bool = True
 
 
 class GpuPool:
@@ -177,8 +199,20 @@ class HaWoRVideoProcessorForService:
         with self.gpu_pool.acquire() as gpu_id:
             env = self._build_env(gpu_id)
             try:
+                processing_video = self._prepare_video_for_processing(
+                    video,
+                    scratch_root,
+                    live_log_path,
+                    env,
+                    peak_rss,
+                )
                 self._run_segmented_pipeline(
-                    video, work_dir, live_log_path, gpu_id, env, peak_rss
+                    processing_video,
+                    work_dir,
+                    live_log_path,
+                    gpu_id,
+                    env,
+                    peak_rss,
                 )
                 self._copy_directory_contents(work_dir / "merged", staged_output_dir, overwrite_output=True)
                 if self.config.cleanup_intermediate and work_dir.exists():
@@ -189,7 +223,11 @@ class HaWoRVideoProcessorForService:
                 # with the staged copy and the 50fps step can interpolate it too.
                 if self.config.run_world_space:
                     self._build_world_space_res(
-                        staged_output_dir, video, live_log_path, env, peak_rss
+                        staged_output_dir,
+                        processing_video,
+                        live_log_path,
+                        env,
+                        peak_rss,
                     )
 
                 # Frames are never extracted to disk; the 50fps interpolation derives
@@ -197,7 +235,11 @@ class HaWoRVideoProcessorForService:
                 extracted_images_50fps_dir: Optional[Path] = None
                 if self.config.run_post_steps or self.config.force_interpolate:
                     self._run_interpolation(
-                        staged_output_dir, video, live_log_path, env, peak_rss
+                        staged_output_dir,
+                        processing_video,
+                        live_log_path,
+                        env,
+                        peak_rss,
                     )
 
                 if not COPY_BACK_DISPARITY_ARTIFACTS:
@@ -207,11 +249,21 @@ class HaWoRVideoProcessorForService:
                 world_space_vis_path: Optional[Path] = None
                 if self.config.run_visualizations:
                     staged_cam_space_vis_path = self._run_cam_space_visualization(
-                        staged_output_dir, video, live_log_path, env, peak_rss)
+                        staged_output_dir,
+                        processing_video,
+                        live_log_path,
+                        env,
+                        peak_rss,
+                    )
                     cam_space_vis_path = out_dir / staged_cam_space_vis_path.name
                     if self.config.run_world_space:
                         staged_world_space_vis_path = self._run_world_space_visualization(
-                            staged_output_dir, video, live_log_path, env, peak_rss)
+                            staged_output_dir,
+                            processing_video,
+                            live_log_path,
+                            env,
+                            peak_rss,
+                        )
                         world_space_vis_path = out_dir / staged_world_space_vis_path.name
 
                 if not self.config.cleanup_intermediate:
@@ -256,6 +308,17 @@ class HaWoRVideoProcessorForService:
             raise ValueError("min_last_segment_seconds must be non-negative")
         if self.config.max_chunk_frames < 2:
             raise ValueError("max_chunk_frames must be >= 2")
+        if self.config.window_context_frames < 0:
+            raise ValueError("window_context_frames must be non-negative")
+        if self.config.temporal_block_frames < 1:
+            raise ValueError("temporal_block_frames must be positive")
+        if (
+            self.config.max_chunk_frames
+            <= 2 * self.config.window_context_frames
+        ):
+            raise ValueError(
+                "max_chunk_frames must exceed twice window_context_frames"
+            )
         if self.config.decord_num_threads < 1:
             raise ValueError("decord_num_threads must be >= 1")
         if self.config.decord_recycle_after < 1:
@@ -266,6 +329,187 @@ class HaWoRVideoProcessorForService:
             raise FileNotFoundError(f"Python executable not found: {sys.executable}")
         if shutil.which("ffmpeg") is None:
             raise FileNotFoundError("ffmpeg not found in PATH")
+        if shutil.which("ffprobe") is None:
+            raise FileNotFoundError("ffprobe not found in PATH")
+
+    def _prepare_video_for_processing(
+        self,
+        video: Path,
+        scratch_root: Path,
+        log_path: Path,
+        env: dict[str, str],
+        peak_rss: _PeakRssTracker,
+    ) -> Path:
+        """Return a decoder-safe input path without modifying the source file.
+
+        Negative presentation timestamps can make a fresh Decord accurate seek
+        return pre-roll pixels from an older logical frame.  CFR inputs without
+        B-frames are rewritten onto an exact frame-index timeline. Other codecs
+        retain their packet spacing/order and are shifted just enough to remove
+        negative timestamps. Both paths are stream copies.
+        """
+        if not self.config.normalize_input_timestamps:
+            self._append_log(log_path, "[input] timestamp normalization disabled")
+            return video
+
+        timing = self._probe_video_timing(video)
+        if not timing.has_negative_presentation_timestamps:
+            self._append_log(
+                log_path,
+                "[input] timestamps already decoder-safe "
+                f"(min_pts={timing.min_pts_seconds:.6f}s, "
+                f"fps={float(timing.fps):.6f})",
+            )
+            return video
+
+        suffix = video.suffix.lower() or ".mp4"
+        normalized = scratch_root / f"_normalized_input{suffix}"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video),
+            "-map",
+            "0:v:0",
+            "-map_metadata",
+            "-1",
+            "-c:v",
+            "copy",
+            "-an",
+            "-sn",
+            "-dn",
+        ]
+        if timing.is_cfr and not timing.has_b_frames:
+            numerator = timing.fps.numerator
+            denominator = timing.fps.denominator
+            timestamp_filter = (
+                f"setts=pts=N*{denominator}/({numerator}*TB):"
+                f"dts=N*{denominator}/({numerator}*TB):"
+                f"duration={denominator}/({numerator}*TB)"
+            )
+            cmd.extend(["-bsf:v", timestamp_filter])
+            normalization_mode = "exact-cfr"
+        else:
+            cmd.extend(["-avoid_negative_ts", "make_zero"])
+            normalization_mode = "offset-preserving"
+        if suffix in {".m4v", ".mov", ".mp4"}:
+            cmd.extend(["-movflags", "+faststart"])
+        cmd.append(str(normalized))
+
+        self._append_log(
+            log_path,
+            "[input] normalizing negative timestamps with a stream copy "
+            f"(mode={normalization_mode}, "
+            f"min_pts={timing.min_pts_seconds:.6f}s)",
+        )
+        self._run_command(cmd, log_path, env, peak_rss)
+        if not normalized.is_file() or normalized.stat().st_size == 0:
+            raise RuntimeError(
+                f"Timestamp normalization did not produce a video: {normalized}"
+            )
+
+        verified = self._probe_video_timing(normalized)
+        if verified.has_negative_presentation_timestamps:
+            raise RuntimeError(
+                "Timestamp normalization failed: output still has negative "
+                f"presentation timestamps ({verified.min_pts_seconds:.6f}s)"
+            )
+        if abs(float(verified.fps) - float(timing.fps)) > 1e-6:
+            raise RuntimeError(
+                "Timestamp normalization changed the nominal frame rate: "
+                f"{float(timing.fps):.6f} -> {float(verified.fps):.6f}"
+            )
+        self._append_log(
+            log_path,
+            "[input] normalized decoder timeline verified "
+            f"(min_pts={verified.min_pts_seconds:.6f}s, "
+            f"path={normalized})",
+        )
+        return normalized
+
+    def _probe_video_timing(self, video: Path) -> VideoTimingInfo:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            (
+                "stream=codec_name,r_frame_rate,avg_frame_rate,has_b_frames:"
+                "packet=pts_time,dts_time,duration_time"
+            ),
+            "-read_intervals",
+            "%+#16",
+            "-of",
+            "json",
+            str(video),
+        ]
+        completed = subprocess.run(
+            cmd,
+            cwd=self.config.project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "unknown ffprobe error"
+            raise RuntimeError(f"Unable to inspect video timestamps: {detail}")
+        try:
+            payload = json.loads(completed.stdout)
+            stream = payload["streams"][0]
+            packets = payload["packets"]
+        except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Unable to parse video timing metadata for {video}"
+            ) from exc
+        if not packets:
+            raise RuntimeError(f"Video contains no readable packets: {video}")
+
+        avg_rate = _parse_frame_rate(stream.get("avg_frame_rate"))
+        real_rate = _parse_frame_rate(stream.get("r_frame_rate"))
+        fps = avg_rate or real_rate
+        if fps is None or fps <= 0:
+            raise RuntimeError(f"Video has no valid nominal frame rate: {video}")
+
+        pts = _packet_times(packets, "pts_time")
+        dts = _packet_times(packets, "dts_time")
+        if not pts:
+            raise RuntimeError(f"Video packets have no presentation timestamps: {video}")
+        if not dts:
+            dts = pts
+
+        nominal_duration = 1.0 / float(fps)
+        tolerance = max(1e-6, nominal_duration * 0.02)
+        durations = _packet_times(packets, "duration_time")
+        pts_steps = [b - a for a, b in zip(pts, pts[1:]) if b > a]
+        cadence_is_constant = all(
+            abs(value - nominal_duration) <= tolerance
+            for value in durations + pts_steps
+        )
+        rates_match = (
+            avg_rate is not None
+            and real_rate is not None
+            and abs(float(avg_rate) - float(real_rate)) <= 1e-6
+        )
+        return VideoTimingInfo(
+            codec_name=str(stream.get("codec_name") or "unknown"),
+            fps=fps,
+            is_cfr=bool(rates_match and cadence_is_constant),
+            has_b_frames=int(stream.get("has_b_frames") or 0) > 0,
+            min_pts_seconds=min(pts),
+            min_dts_seconds=min(dts),
+        )
+
+    def _append_log(self, log_path: Path, message: str) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(f"{message}\n")
 
     def _build_env(self, gpu_id: int) -> dict[str, str]:
         env = os.environ.copy()
@@ -299,6 +543,10 @@ class HaWoRVideoProcessorForService:
             str(self.config.min_last_segment_seconds),
             "--max_chunk_frames",
             str(self.config.max_chunk_frames),
+            "--window_context_frames",
+            str(self.config.window_context_frames),
+            "--temporal_block_frames",
+            str(self.config.temporal_block_frames),
             "--overlap_policy",
             self.config.overlap_policy,
             "--vis_mode",
@@ -640,6 +888,28 @@ class HaWoRVideoProcessorForService:
                     f"acceptance_threshold_bytes={PEAK_RSS_ACCEPTANCE_BYTES} "
                     f"acceptance={'PASS' if within_limit else 'FAIL'}\n"
                 )
+
+
+def _parse_frame_rate(value: object) -> Optional[Fraction]:
+    if value in (None, "", "0/0"):
+        return None
+    try:
+        rate = Fraction(str(value))
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if rate > 0 else None
+
+
+def _packet_times(packets: Sequence[object], key: str) -> list[float]:
+    values: list[float] = []
+    for packet in packets:
+        if not isinstance(packet, dict) or packet.get(key) in (None, "N/A"):
+            continue
+        try:
+            values.append(float(packet[key]))
+        except (TypeError, ValueError):
+            continue
+    return values
 
 
 def _read_process_tree_rss_bytes(root_pid: int) -> int:
