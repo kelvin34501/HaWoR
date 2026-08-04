@@ -34,7 +34,6 @@ from lib.pipeline.window_planner import compute_windows, processing_windows
 
 
 RANGE_RE = re.compile(r"(\d+)_(\d+)(?:_50fps)?\.json$")
-RANGE_NAME_RE = re.compile(r"^(\d+)_(\d+)((?:_50fps)?\.json)$")
 FIELDS = ["init_root_orient", "init_hand_pose", "init_trans", "init_betas"]
 SLAM_MAIN_RE = re.compile(r"^hawor_slam_w_scale_(\d+)_(\d+)\.npz$")
 
@@ -124,82 +123,72 @@ def chunk_local_span(cam_space_dir: str) -> int:
     return max_end + 1 if max_end >= 0 else 0
 
 
-def to_np(v) -> np.ndarray:
-    return np.asarray(v, dtype=np.float32)
-
-
-def ensure_capacity(arr: np.ndarray, new_t: int) -> np.ndarray:
-    if arr.shape[1] >= new_t:
-        return arr
-    pad_shape = list(arr.shape)
-    pad_shape[1] = new_t - arr.shape[1]
-    pad = np.zeros(pad_shape, dtype=arr.dtype)
-    return np.concatenate([arr, pad], axis=1)
-
-
-def ensure_capacity_mask(mask: np.ndarray, new_t: int) -> np.ndarray:
-    if mask.shape[0] >= new_t:
-        return mask
-    pad = np.zeros((new_t - mask.shape[0],), dtype=bool)
-    return np.concatenate([mask, pad], axis=0)
-
-
-def shifted_json_name(json_path: str, offset: int) -> str:
-    name = os.path.basename(json_path)
-    m = RANGE_NAME_RE.match(name)
-    if not m:
-        raise ValueError(f"Invalid chunk json name (expect start_end.json): {json_path}")
-    start = int(m.group(1)) + offset
-    end = int(m.group(2)) + offset
-    suffix = m.group(3)
-    return f"{start}_{end}{suffix}"
-
-
-def clipped_cam_space_chunk(json_path: str, meta: ChunkMeta):
-    name = os.path.basename(json_path)
-    m = RANGE_NAME_RE.match(name)
-    if not m:
-        raise ValueError(f"Invalid chunk json name (expect start_end.json): {json_path}")
-
-    local_start = int(m.group(1))
-    local_end = int(m.group(2))
-    suffix = m.group(3)
-    global_start = meta.process_start + local_start
-    global_end = meta.process_start + local_end
-    keep_start = max(global_start, meta.owned_start)
-    keep_end = min(global_end, meta.owned_end - 1)
-    if keep_start > keep_end:
-        return None
-
-    local_keep_start = keep_start - global_start
-    local_keep_end = keep_end - global_start + 1
-    with open(json_path, "r") as f:
-        data = json.load(f)
-
-    out = {}
-    expected_len = local_end - local_start + 1
-    for key, value in data.items():
-        if key in FIELDS:
-            arr = np.asarray(value)
-            if arr.ndim < 2 or arr.shape[1] < local_keep_end:
-                raise ValueError(
-                    f"Invalid {key} shape in {json_path}: {arr.shape}; "
-                    f"expected at least {expected_len} frames on axis 1"
-                )
-            out[key] = arr[:, local_keep_start:local_keep_end].tolist()
-        else:
-            out[key] = value
-
-    return f"{keep_start}_{keep_end}{suffix}", out
-
-
 def merge_cam_space(
     chunk_metas: List[ChunkMeta],
     out_dir: str,
     overlap_policy: str,
 ) -> None:
+    """Blend camera-space predictions from shared context into one timeline.
+
+    Independent outer windows restart tracking, and a hand track's first frame
+    need not share the global 16-frame model phase.  Both adjacent runs predict
+    the shared context, so taper those predictions across the boundary instead
+    of hard-cutting from one temporal phase to another.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    copied_count = 0
+    # hand -> global frame -> [(window weight, per-field frame values)]
+    samples: Dict[str, Dict[int, List[Tuple[float, Dict[str, np.ndarray]]]]] = {}
+    timeline_end = max((meta.owned_end for meta in chunk_metas), default=0)
+    output_boundaries = {
+        meta.owned_end
+        for meta in chunk_metas
+        if meta.owned_end < timeline_end
+    }
+
+    def _window_weight(meta: ChunkMeta, global_frame: int) -> float:
+        if global_frame < meta.owned_start:
+            span = max(1, meta.owned_start - meta.process_start)
+            return (global_frame - meta.process_start + 1) / (span + 1)
+        if global_frame >= meta.owned_end:
+            span = max(1, meta.process_end - meta.owned_end)
+            return (meta.process_end - global_frame) / (span + 1)
+        return 1.0
+
+    def _weighted_rotation(values: List[np.ndarray], weights: np.ndarray) -> np.ndarray:
+        matrices = np.stack(values, axis=0).astype(np.float64)
+        weight_shape = (len(weights),) + (1,) * (matrices.ndim - 1)
+        mixed = np.sum(matrices * weights.reshape(weight_shape), axis=0)
+        u, _, vh = np.linalg.svd(mixed)
+        rotation = u @ vh
+        negative = np.linalg.det(rotation) < 0
+        if np.any(negative):
+            u = u.copy()
+            u[..., :, -1] *= np.where(negative, -1.0, 1.0)[..., None]
+            rotation = u @ vh
+        return rotation.astype(np.float32)
+
+    def _blend_frame(
+        frame_samples: List[Tuple[float, Dict[str, np.ndarray]]]
+    ) -> Dict[str, np.ndarray]:
+        if len(frame_samples) == 1:
+            return {
+                field: np.asarray(frame_samples[0][1][field], dtype=np.float32).copy()
+                for field in FIELDS
+            }
+        weights = np.asarray([sample[0] for sample in frame_samples], dtype=np.float64)
+        weights /= weights.sum()
+        blended: Dict[str, np.ndarray] = {}
+        for field in FIELDS:
+            values = [sample[1][field] for sample in frame_samples]
+            if field in {"init_root_orient", "init_hand_pose"}:
+                blended[field] = _weighted_rotation(values, weights)
+            else:
+                stacked = np.stack(values, axis=0).astype(np.float64)
+                weight_shape = (len(weights),) + (1,) * (stacked.ndim - 1)
+                blended[field] = np.sum(
+                    stacked * weights.reshape(weight_shape), axis=0
+                ).astype(np.float32)
+        return blended
 
     for meta in chunk_metas:
         cam_space_dir = os.path.join(meta.seq_dir, "cam_space")
@@ -213,28 +202,88 @@ def merge_cam_space(
             json_files = sorted(glob.glob(os.path.join(hand_dir, "*.json")))
             if not json_files:
                 continue
-            hand_out_dir = os.path.join(out_dir, hand_id)
-            os.makedirs(hand_out_dir, exist_ok=True)
+            hand_samples = samples.setdefault(hand_id, {})
 
             for fp in json_files:
-                clipped = clipped_cam_space_chunk(fp, meta)
-                if clipped is None:
-                    continue
-                dst_name, data = clipped
-                dst_path = os.path.join(hand_out_dir, dst_name)
+                local_start, local_end = parse_range(fp)
+                with open(fp, "r") as f:
+                    data = json.load(f)
+                arrays = {field: np.asarray(data[field]) for field in FIELDS}
+                if any(array.ndim < 2 or array.shape[0] < 1 for array in arrays.values()):
+                    shapes = {field: array.shape for field, array in arrays.items()}
+                    raise ValueError(f"Invalid camera-space field shape in {fp}: {shapes}")
+                lengths = {field: array.shape[1] for field, array in arrays.items()}
+                expected_length = local_end - local_start + 1
+                if any(length < expected_length for length in lengths.values()):
+                    raise ValueError(
+                        f"Invalid camera-space field length in {fp}: {lengths}; "
+                        f"expected at least {expected_length}"
+                    )
 
-                if os.path.exists(dst_path):
-                    if overlap_policy == "keep_first":
+                for local_offset in range(expected_length):
+                    global_frame = meta.process_start + local_start + local_offset
+                    if global_frame < 0:
                         continue
-                    os.remove(dst_path)
+                    # Never publish right-context samples beyond the owned video
+                    # timeline. They remain available only as contributions to an
+                    # adjacent window's owned frames.
+                    if global_frame >= timeline_end:
+                        continue
+                    frame_values = {
+                        field: np.asarray(
+                            array[0, local_offset],
+                            dtype=np.float32,
+                        ).copy()
+                        for field, array in arrays.items()
+                    }
+                    hand_samples.setdefault(global_frame, []).append(
+                        (_window_weight(meta, global_frame), frame_values)
+                    )
 
-                with open(dst_path, "w") as f:
-                    json.dump(data, f, indent=1)
-                copied_count += 1
+    written_chunks = 0
+    for hand_id, hand_samples in sorted(samples.items()):
+        if not hand_samples:
+            continue
+        hand_out_dir = os.path.join(out_dir, hand_id)
+        os.makedirs(hand_out_dir, exist_ok=True)
+        frames = sorted(hand_samples)
+        breaks = [0]
+        breaks.extend(
+            index
+            for index in range(1, len(frames))
+            if (
+                frames[index] != frames[index - 1] + 1
+                or frames[index] in output_boundaries
+            )
+        )
+        breaks.append(len(frames))
+        for begin, finish in zip(breaks, breaks[1:]):
+            segment_frames = frames[begin:finish]
+            blended_frames = [
+                _blend_frame(hand_samples[global_frame])
+                for global_frame in segment_frames
+            ]
+            output = {
+                field: np.stack(
+                    [frame[field] for frame in blended_frames],
+                    axis=0,
+                )[None].tolist()
+                for field in FIELDS
+            }
+            path = os.path.join(
+                hand_out_dir,
+                f"{segment_frames[0]}_{segment_frames[-1]}.json",
+            )
+            with open(path, "w") as f:
+                json.dump(output, f, indent=1)
+            written_chunks += 1
 
-    if copied_count == 0:
+    if written_chunks == 0:
         raise RuntimeError("No cam_space chunks found to merge")
-    log(f"[merge] Copied {copied_count} cam_space json files into {out_dir}")
+    log(
+        f"[merge] Blended camera-space context into {written_chunks} contiguous "
+        f"track chunk(s) under {out_dir} (policy={overlap_policy})"
+    )
 
 
 def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) -> Optional[str]:
@@ -250,12 +299,14 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
     img_focal = None
     img_center = None
     # Each window is an independent SLAM run. Normalize every window to metric,
-    # align overlapping boundary frames when present, and write only the owned
+    # robustly align it from all shared context poses, and write only the owned
     # non-overlapping range to the merged trajectory.
     window_starts: List[int] = []
     slam_run_ranges: List[Tuple[int, int]] = []
     overlap_frames: List[int] = []
-    anchors: Dict[int, torch.Tensor] = {}
+    slam_fallback_ranges: List[Tuple[int, int]] = []
+    slam_fallback_modes: List[str] = []
+    alignment_refs: Dict[int, torch.Tensor] = {}
     expected_end = max((m.owned_end for m in chunk_metas), default=0)
     saw_alignment_gap = False
 
@@ -272,6 +323,41 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
         q_wxyz = rotation_matrix_to_quaternion(t4[:, :3, :3])
         out[:, 3:7] = q_wxyz[:, [1, 2, 3, 0]].cpu().numpy()
         return out
+
+    def _robust_rigid_alignment(corrections: torch.Tensor) -> torch.Tensor:
+        """Average per-overlap rigid corrections without averaging matrices."""
+        rotation_sum = corrections[:, :3, :3].sum(dim=0)
+        u, _, vh = torch.linalg.svd(rotation_sum)
+        rotation = u @ vh
+        if torch.linalg.det(rotation) < 0:
+            u = u.clone()
+            u[:, -1] *= -1
+            rotation = u @ vh
+        translation = corrections[:, :3, 3].median(dim=0).values
+        aligned = torch.eye(4, dtype=corrections.dtype)
+        aligned[:3, :3] = rotation
+        aligned[:3, 3] = translation
+        return aligned
+
+    def _blend_rigid(reference: torch.Tensor, current: torch.Tensor, alpha: float) -> torch.Tensor:
+        """Blend a close pair of rigid poses and project rotation back to SO(3)."""
+        mixed_rotation = (
+            (1.0 - alpha) * reference[:3, :3]
+            + alpha * current[:3, :3]
+        )
+        u, _, vh = torch.linalg.svd(mixed_rotation)
+        rotation = u @ vh
+        if torch.linalg.det(rotation) < 0:
+            u = u.clone()
+            u[:, -1] *= -1
+            rotation = u @ vh
+        blended = torch.eye(4, dtype=current.dtype)
+        blended[:3, :3] = rotation
+        blended[:3, 3] = (
+            (1.0 - alpha) * reference[:3, 3]
+            + alpha * current[:3, 3]
+        )
+        return blended
 
     def _ensure_traj_capacity(new_t: int) -> None:
         nonlocal traj_buf, traj_valid
@@ -339,20 +425,68 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
             file_global_start = meta.process_start + local_start
             file_global_end = file_global_start + traj_len
             slam_run_ranges.append((file_global_start, file_global_end))
+            slam_valid = bool(
+                np.asarray(data.get("slam_valid", True)).reshape(-1)[0]
+            )
+            if not slam_valid:
+                fallback_mode = str(
+                    np.asarray(
+                        data.get("slam_fallback", "unspecified")
+                    ).reshape(-1)[0]
+                )
+                fallback_start = max(file_global_start, meta.owned_start)
+                fallback_end = min(file_global_end, meta.owned_end)
+                if fallback_start < fallback_end:
+                    slam_fallback_ranges.append(
+                        (fallback_start, fallback_end)
+                    )
+                    slam_fallback_modes.append(fallback_mode)
 
-            boundary = meta.owned_start
-            boundary_row = boundary - file_global_start
-            if boundary in anchors and 0 <= boundary_row < traj_len:
-                A = anchors[boundary] @ torch.linalg.inv(t4[boundary_row])
-                t4 = A.unsqueeze(0) @ t4
-                overlap_frames.append(int(boundary))
-            elif meta.owned_start > 0:
-                saw_alignment_gap = True
+            all_row_globals = np.arange(
+                file_global_start,
+                file_global_end,
+                dtype=np.int64,
+            )
+            if meta.owned_start > 0:
+                matched = [
+                    (row, int(global_frame))
+                    for row, global_frame in enumerate(all_row_globals)
+                    if int(global_frame) in alignment_refs
+                ]
+                if matched:
+                    corrections = torch.stack(
+                        [
+                            alignment_refs[global_frame]
+                            @ torch.linalg.inv(t4[row])
+                            for row, global_frame in matched
+                        ],
+                        dim=0,
+                    )
+                    alignment = _robust_rigid_alignment(corrections)
+                    t4 = alignment.unsqueeze(0) @ t4
+                    overlap_frames.extend(
+                        global_frame for _, global_frame in matched
+                    )
+                    owned_overlap = [
+                        (row, global_frame)
+                        for row, global_frame in matched
+                        if global_frame >= meta.owned_start
+                    ]
+                    for index, (row, global_frame) in enumerate(owned_overlap):
+                        alpha = (index + 1) / len(owned_overlap)
+                        t4[row] = _blend_rigid(
+                            alignment_refs[global_frame],
+                            t4[row],
+                            alpha,
+                        )
+                else:
+                    saw_alignment_gap = True
 
-            anchor_boundary = meta.owned_end
-            anchor_row = anchor_boundary - file_global_start
-            if meta.process_end > meta.owned_end and 0 <= anchor_row < traj_len:
-                anchors[int(anchor_boundary)] = t4[anchor_row].clone()
+            # Keep aligned context poses for the next independent SLAM window.
+            # Later windows replace shared entries after they themselves have
+            # been aligned, forming a stable chain across long videos.
+            for row, global_frame in enumerate(all_row_globals):
+                alignment_refs[int(global_frame)] = t4[row].clone()
 
             traj = _t4_to_traj(t4, traj)
 
@@ -362,7 +496,7 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
             if traj_buf is None:
                 traj_buf = np.zeros((0, traj.shape[1]), dtype=np.float32)
 
-            row_globals = np.arange(file_global_start, file_global_end, dtype=np.int64)
+            row_globals = all_row_globals
             owned_rows = np.where((row_globals >= meta.owned_start) & (row_globals < meta.owned_end))[0]
             if owned_rows.size == 0:
                 continue
@@ -452,6 +586,15 @@ def merge_slam(chunk_metas: List[ChunkMeta], out_dir: str, overlap_policy: str) 
         slam_run_ranges=np.asarray(slam_run_ranges, dtype=np.int64),
         overlap_frames=np.asarray(sorted(set(overlap_frames)), dtype=np.int64),
         overlap_aligned=np.asarray(overlap_aligned),
+        slam_valid=np.asarray(not slam_fallback_ranges),
+        slam_fallback=np.asarray(
+            "none" if not slam_fallback_ranges else "partial"
+        ),
+        slam_fallback_ranges=np.asarray(
+            slam_fallback_ranges,
+            dtype=np.int64,
+        ).reshape(-1, 2),
+        slam_fallback_modes=np.asarray(slam_fallback_modes),
     )
     log(f"[merge] Saved {out_path} (frames=[0, {expected_end}))")
     return out_path
@@ -473,9 +616,20 @@ def build_chunk_meta(windows: List[Tuple[int, int]], proc_windows: List[Tuple[in
     return metas
 
 
-def write_manifest(manifest_path: str, video_path: str, metas: List[ChunkMeta]) -> None:
+def write_manifest(
+    manifest_path: str,
+    video_path: str,
+    metas: List[ChunkMeta],
+    *,
+    window_context_frames: int = 0,
+    temporal_block_frames: int = 1,
+) -> None:
     data = {
         "video": video_path,
+        "window_context_frames": window_context_frames,
+        "temporal_block_frames": temporal_block_frames,
+        "camera_space_merge": "rotation_aware_context_crossfade",
+        "slam_merge": "multi_pose_rigid_alignment_and_overlap_blend",
         "chunks": [
             {
                 "chunk_path": m.chunk_path,
@@ -523,14 +677,24 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
         chunk_frames,
         min_last_frames,
         max_chunk_frames=args.max_chunk_frames,
+        left_context_frames=args.window_context_frames,
+        right_context_frames=args.window_context_frames,
+        alignment_frames=args.temporal_block_frames,
+    )
+    proc_windows = processing_windows(
+        windows,
+        n_frames,
+        left_context_frames=args.window_context_frames,
+        right_context_frames=args.window_context_frames,
     )
     if not windows:
         raise RuntimeError(f"No frames decoded from {video_abs}")
-    proc_windows = processing_windows(windows, n_frames)
     largest_process_window = max(end - start for start, end in proc_windows)
     log(
         f"[plan ] {n_frames} frames @ {args.target_fps}fps -> {len(windows)} windows "
-        f"(+1 SLAM overlap, largest={largest_process_window}, cap={args.max_chunk_frames})"
+        f"(context=+/-{args.window_context_frames}, "
+        f"alignment={args.temporal_block_frames}, "
+        f"largest={largest_process_window}, cap={args.max_chunk_frames})"
     )
 
     seq_dirs: List[str] = [os.path.join(work_root, f"chunk_{i:06d}") for i in range(len(windows))]
@@ -561,7 +725,13 @@ def process_video(args: argparse.Namespace, video_path: str) -> None:
 
     metas = build_chunk_meta(windows, proc_windows, seq_dirs)
     manifest_path = os.path.join(work_root, "chunk_manifest.json")
-    write_manifest(manifest_path, video_abs, metas)
+    write_manifest(
+        manifest_path,
+        video_abs,
+        metas,
+        window_context_frames=args.window_context_frames,
+        temporal_block_frames=args.temporal_block_frames,
+    )
 
     merged_cam_dir = os.path.join(merged_root, "cam_space")
     merge_cam_space(
@@ -644,7 +814,26 @@ def make_parser() -> argparse.ArgumentParser:
         "--max_chunk_frames",
         type=int,
         default=3001,
-        help="Hard cap on frames processed by one window, including the one-frame SLAM overlap (default: 3001)",
+        help="Hard cap on frames processed by one window, including temporal context (default: 3001)",
+    )
+    p.add_argument(
+        "--window_context_frames",
+        type=int,
+        default=16,
+        help=(
+            "Real-frame context added on each side of an owned window. Context "
+            "predictions are crossfaded at seams, while only the owned global "
+            "timeline is published (default: 16)."
+        ),
+    )
+    p.add_argument(
+        "--temporal_block_frames",
+        type=int,
+        default=16,
+        help=(
+            "Align every interior owned boundary to this global temporal-model "
+            "block size (default: 16)."
+        ),
     )
     p.add_argument("--target_fps", type=float, default=30, help="Decode/resample fps (matches old ffmpeg fps=N); passed to demo.py")
 
@@ -680,6 +869,10 @@ def main() -> None:
         raise ValueError("--min_last_segment_seconds must be >= 0")
     if args.max_chunk_frames < 2:
         raise ValueError("--max_chunk_frames must be >= 2")
+    if args.window_context_frames < 0:
+        raise ValueError("--window_context_frames must be >= 0")
+    if args.temporal_block_frames < 1:
+        raise ValueError("--temporal_block_frames must be >= 1")
 
     videos = collect_videos(args)
     if not videos:

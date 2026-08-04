@@ -218,6 +218,22 @@ def _normalize_quat_xyzw(quat):
 def _interpolated_slam_metadata(data, t_new):
     """Carry raw-SLAM merge metadata onto the interpolated timeline."""
     meta = {}
+    for key in ("slam_valid", "slam_fallback", "slam_fallback_modes"):
+        if key in data:
+            meta[key] = data[key]
+    if "slam_fallback_ranges" in data:
+        mapped_ranges = []
+        ranges = np.asarray(data["slam_fallback_ranges"], dtype=np.int64).reshape(-1, 2)
+        for start, end in ranges:
+            mapped_start = int(np.searchsorted(t_new, float(start), side="left"))
+            mapped_end = int(np.searchsorted(t_new, float(end), side="left"))
+            mapped_start = max(0, min(mapped_start, len(t_new) - 1))
+            mapped_end = max(mapped_start + 1, min(mapped_end, len(t_new)))
+            mapped_ranges.append((mapped_start, mapped_end))
+        meta["slam_fallback_ranges"] = np.asarray(
+            mapped_ranges,
+            dtype=np.int64,
+        ).reshape(-1, 2)
     if "overlap_aligned" in data:
         meta["overlap_aligned"] = data["overlap_aligned"]
     if "window_starts" in data:
